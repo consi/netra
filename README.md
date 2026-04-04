@@ -65,7 +65,7 @@ docker run -p 1337:1337 -p 2055:2055/udp netra
 
 ## Excluding Your Own ASN
 
-When running netra on your router, your own ASN will dominate the charts. Use `--skip-asns` to exclude it:
+When running netra on against your router, your own ASN will dominate the charts. Use `--skip-asns` to exclude it:
 
 ```bash
 netra --skip-asns 12345
@@ -78,7 +78,7 @@ To configure this in a systemd unit, edit the service with `systemctl edit netra
 # /etc/systemd/system/netra.service.d/override.conf
 [Service]
 ExecStart=
-ExecStart=/usr/local/bin/netra --skip-asns 12345
+ExecStart=/usr/bin/netra --skip-asns 12345
 ```
 
 Then reload and restart:
