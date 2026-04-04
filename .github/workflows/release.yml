@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install clang (for BPF/XDP compilation)
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+
+      - name: Install cross-compilation tools
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # Update Cargo.toml version
+          sed -i "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+
+      - name: Build frontend
+        run: cd frontend && pnpm install --frozen-lockfile && VITE_APP_VERSION=${{ env.VERSION }} pnpm run build
+
+      - name: Run tests
+        if: matrix.arch == 'amd64'
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist/pkg
+          cp target/${{ matrix.target }}/release/netra dist/pkg/
+          strip dist/pkg/netra 2>/dev/null || true
+          cd dist/pkg && tar czf ../../netra-${VERSION}-linux-${{ matrix.arch }}.tar.gz netra
+
+      - name: Build .deb package
+        run: |
+          PKG=netra_${VERSION}_${{ matrix.arch }}
+          mkdir -p dist/$PKG/DEBIAN
+          mkdir -p dist/$PKG/usr/bin
+          mkdir -p dist/$PKG/lib/systemd/system
+          mkdir -p dist/$PKG/var/lib/netra
+          cp target/${{ matrix.target }}/release/netra dist/$PKG/usr/bin/
+          strip dist/$PKG/usr/bin/netra 2>/dev/null || true
+          cp dist/netra.service dist/$PKG/lib/systemd/system/
+          cat > dist/$PKG/DEBIAN/control << EOF
+          Package: netra
+          Version: ${VERSION}
+          Architecture: ${{ matrix.arch }}
+          Maintainer: netra
+          Description: NetFlow/IPFIX traffic analyzer with real-time dashboard
+          EOF
+          cat > dist/$PKG/DEBIAN/postinst << 'POSTINST'
+          #!/bin/sh
+          set -e
+          if ! getent group netra >/dev/null 2>&1; then
+            groupadd --system netra
+          fi
+          if ! getent passwd netra >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir /var/lib/netra --shell /usr/sbin/nologin --gid netra netra
+          fi
+          chown netra:netra /var/lib/netra
+          POSTINST
+          chmod 0755 dist/$PKG/DEBIAN/postinst
+          dpkg-deb --build dist/$PKG
+          mv dist/$PKG.deb netra-${VERSION}-${{ matrix.arch }}.deb
+
+      - name: Build .rpm package
+        run: |
+          sudo apt-get install -y rpm
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cat > rpmbuild/SPECS/netra.spec << 'EOF'
+          Name: netra
+          Version: %{version}
+          Release: 1
+          Summary: NetFlow/IPFIX traffic analyzer
+          License: MIT
+          %description
+          Real-time NetFlow/IPFIX traffic analyzer with ASN attribution and web dashboard.
+          %pre
+          getent group netra >/dev/null 2>&1 || groupadd --system netra
+          getent passwd netra >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /var/lib/netra --shell /usr/sbin/nologin --gid netra netra
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/lib/systemd/system
+          mkdir -p %{buildroot}/var/lib/netra
+          cp %{_sourcedir}/netra %{buildroot}/usr/bin/
+          cp %{_sourcedir}/netra.service %{buildroot}/lib/systemd/system/
+          %post
+          chown netra:netra /var/lib/netra
+          %files
+          /usr/bin/netra
+          /lib/systemd/system/netra.service
+          %dir %attr(0755,netra,netra) /var/lib/netra
+          EOF
+          cp target/${{ matrix.target }}/release/netra rpmbuild/SOURCES/
+          strip rpmbuild/SOURCES/netra 2>/dev/null || true
+          cp dist/netra.service rpmbuild/SOURCES/
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" \
+                   --define "version ${VERSION}" \
+                   --target ${{ matrix.arch == 'amd64' && 'x86_64' || 'aarch64' }} \
+                   -bb rpmbuild/SPECS/netra.spec
+          cp rpmbuild/RPMS/*/*.rpm netra-${VERSION}-${{ matrix.arch }}.rpm
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build \
+            --build-arg TARGET=${{ matrix.target }} \
+            --build-arg BINARY=target/${{ matrix.target }}/release/netra \
+            -f Dockerfile.release \
+            -t ghcr.io/${{ github.repository }}:${VERSION}-${{ matrix.arch }} \
+            .
+          docker push ghcr.io/${{ github.repository }}:${VERSION}-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            netra-*.tar.gz
+            netra-*.deb
+            netra-*.rpm
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch Docker manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker manifest create ghcr.io/${{ github.repository }}:${VERSION} \
+            ghcr.io/${{ github.repository }}:${VERSION}-amd64 \
+            ghcr.io/${{ github.repository }}:${VERSION}-arm64
+          docker manifest push ghcr.io/${{ github.repository }}:${VERSION}
+          docker manifest create ghcr.io/${{ github.repository }}:latest \
+            ghcr.io/${{ github.repository }}:${VERSION}-amd64 \
+            ghcr.io/${{ github.repository }}:${VERSION}-arm64
+          docker manifest push ghcr.io/${{ github.repository }}:latest
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            netra-*.tar.gz
+            netra-*.deb
+            netra-*.rpm
+          generate_release_notes: true

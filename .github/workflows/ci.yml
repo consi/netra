@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install clang (for BPF/XDP compilation)
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ hashFiles('Cargo.lock') }}
+
+      - name: Cache pnpm
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: pnpm-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+
+      - name: Install frontend deps
+        run: cd frontend && pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: cd frontend && pnpm run build
+
+      - name: Check formatting
+        run: cargo fmt -- --check && cd frontend && pnpm run format:check
+
+      - name: Lint
+        run: cargo clippy -- -D warnings && cd frontend && pnpm run lint
+
+      - name: Test
+        run: cargo test && cd frontend && pnpm run test
+
+      - name: Build
+        run: cargo build --release

@@ -1,0 +1,37 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash -c 'source "$HOME/.cargo/env" && cargo fmt --'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: bash -c 'source "$HOME/.cargo/env" && cargo clippy -- -D warnings'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: frontend-lint
+        name: frontend lint
+        entry: bash -c 'cd frontend && pnpm run lint'
+        language: system
+        files: ^frontend/
+
+      - id: frontend-format-check
+        name: frontend format check
+        entry: bash -c 'cd frontend && pnpm run format:check'
+        language: system
+        files: ^frontend/

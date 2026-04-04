@@ -1,0 +1,60 @@
+[Unit]
+Description=netra - NetFlow/IPFIX traffic analyzer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/netra
+Restart=always
+RestartSec=5
+User=netra
+Group=netra
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/netra
+WorkingDirectory=/var/lib/netra
+Environment=RUST_LOG=info
+
+# Required for socket binding; also enables AF_XDP when configured
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+
+# -------------------------------------------------------------------
+# UDP Receive Modes (auto-detected at startup, logged to journal)
+# -------------------------------------------------------------------
+#
+# 1. AF_XDP (zero-copy kernel bypass) — fastest
+#    Packets go straight from the NIC to userspace via shared memory
+#    ring buffers, completely bypassing the kernel network stack.
+#    One thread per NIC RX queue, BPF program filters UDP port 2055.
+#
+#    Requirements:
+#      - Linux kernel >= 5.4 (>= 5.10 recommended for shared UMEM)
+#      - CAP_NET_ADMIN + CAP_BPF (granted above)
+#      - NIC with XDP driver support:
+#          Intel: i40e, ice, ixgbe
+#          Mellanox: mlx5
+#          Amazon: ena (kernel 6.x+)
+#          VMs: virtio supports copy-mode XDP (slower than native)
+#      - clang at build time (compiles the BPF filter program)
+#
+#    To enable, set the interface name:
+#      Environment=NETRA_XDP_IFACE=eth0
+#
+#    If AF_XDP setup fails (unsupported NIC, missing caps), netra
+#    automatically falls back to recvmmsg with a warning in the log.
+#
+# 2. recvmmsg (batch receive) — default
+#    Receives up to 32 UDP datagrams per syscall via recvmmsg(2).
+#    2-3x throughput vs single recv_from. No special config needed.
+#    Uses SO_REUSEPORT with one thread per CPU core.
+#
+# 3. recv_from (single datagram) — fallback
+#    Standard one-syscall-per-packet receive. Only used on kernels
+#    that lack recvmmsg (< 2.6.33, effectively never on modern Linux).
+#
+# The active mode is logged at startup:
+#   journalctl -u netra | grep "UDP receive"
+# -------------------------------------------------------------------
+
+[Install]
+WantedBy=multi-user.target
