@@ -22,6 +22,7 @@ struct Assets;
 pub struct AppState {
     pub asn_db: Arc<ArcSwap<asn::AsnDb>>,
     pub windows: Arc<pipeline::WindowManager>,
+    pub skip_asns: Vec<u32>,
 }
 
 #[derive(Parser)]
@@ -41,6 +42,10 @@ struct Args {
     /// Path to the ASN database file
     #[arg(short = 'd', long, default_value = None)]
     db_path: Option<PathBuf>,
+
+    /// Comma-separated list of ASNs to exclude from charts and lists
+    #[arg(long, value_delimiter = ',')]
+    skip_asns: Vec<u32>,
 }
 
 #[tokio::main]
@@ -129,9 +134,14 @@ async fn main() {
     tokio::spawn(pipeline::snapshot_loop(windows.clone()));
     tokio::spawn(asn::refresh_loop(db_path, asn_swap.clone()));
 
+    if !args.skip_asns.is_empty() {
+        tracing::info!("Excluding ASNs from charts: {:?}", args.skip_asns);
+    }
+
     let state = Arc::new(AppState {
         asn_db: asn_swap,
         windows,
+        skip_asns: args.skip_asns,
     });
 
     let app = Router::new()

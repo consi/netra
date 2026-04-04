@@ -77,6 +77,7 @@ fn aggregate_direction(
     windows: &[Arc<FrozenWindow>],
     asn_db: &AsnDb,
     top_n: usize,
+    skip_asns: &[u32],
     get_map: impl Fn(&FrozenWindow) -> &HashMap<(u16, u32), crate::pipeline::window::FlowStats>,
 ) -> HashMap<String, DirectionData> {
     let mut acc: HashMap<u16, HashMap<u32, (u64, u64, u64)>> = HashMap::new();
@@ -98,11 +99,16 @@ fn aggregate_direction(
         let mut entries: Vec<(u32, u64, u64, u64)> = Vec::new();
 
         for (&asn, &(bytes, flows, packets)) in &asn_map {
+            if skip_asns.contains(&asn) {
+                continue;
+            }
             total_bytes += bytes;
             total_flows += flows;
             total_packets += packets;
             entries.push((asn, bytes, flows, packets));
         }
+
+        let total_asns = entries.len();
 
         entries.sort_by(|a, b| b.1.cmp(&a.1));
         entries.truncate(top_n);
@@ -130,8 +136,6 @@ fn aggregate_direction(
             })
             .collect();
 
-        let total_asns = asn_map.len();
-
         result.insert(
             vlan.to_string(),
             DirectionData {
@@ -151,10 +155,11 @@ fn aggregate_windows(
     windows: &[Arc<FrozenWindow>],
     asn_db: &AsnDb,
     top_n: usize,
+    skip_asns: &[u32],
     now: u64,
 ) -> SseResponse {
-    let upload_map = aggregate_direction(windows, asn_db, top_n, |w| &w.upload);
-    let download_map = aggregate_direction(windows, asn_db, top_n, |w| &w.download);
+    let upload_map = aggregate_direction(windows, asn_db, top_n, skip_asns, |w| &w.upload);
+    let download_map = aggregate_direction(windows, asn_db, top_n, skip_asns, |w| &w.download);
 
     let all_vlans: std::collections::HashSet<&String> =
         upload_map.keys().chain(download_map.keys()).collect();
@@ -211,7 +216,7 @@ fn build_message(state: &crate::AppState, config: &StreamConfig) -> Option<Strin
         .as_secs();
     let windows = collect_windows(&state.windows, config.window);
     let asn_db = state.asn_db.load();
-    let mut response = aggregate_windows(&windows, &asn_db, config.top_n, now);
+    let mut response = aggregate_windows(&windows, &asn_db, config.top_n, &state.skip_asns, now);
     response.window = config.window;
     serde_json::to_string(&response).ok()
 }
@@ -309,7 +314,7 @@ mod tests {
             vec![(10, vec![(100, 300, 2)])],
             vec![(10, vec![(100, 100, 1)])],
         ));
-        let resp = aggregate_windows(&[w1, w2], &db, 20, 1010);
+        let resp = aggregate_windows(&[w1, w2], &db, 20, &[], 1010);
         let vlan = &resp.vlans["10"];
         assert_eq!(vlan.upload.total_bytes, 800);
         assert_eq!(vlan.upload.total_flows, 5);
@@ -328,7 +333,7 @@ mod tests {
             vec![(10, vec![(1, 1000, 10), (2, 500, 5), (3, 200, 2)])],
             vec![],
         ));
-        let resp = aggregate_windows(&[w], &db, 2, 1010);
+        let resp = aggregate_windows(&[w], &db, 2, &[], 1010);
         let vlan = &resp.vlans["10"];
         assert_eq!(vlan.upload.total_bytes, 1700);
         assert_eq!(vlan.upload.total_flows, 17);
@@ -341,7 +346,7 @@ mod tests {
     fn test_aggregate_enriches_metadata() {
         let db = make_asn_db(vec![(13335, "Cloudflare", "US")]);
         let w = Arc::new(make_window(1000, vec![(10, vec![(13335, 100, 1)])], vec![]));
-        let resp = aggregate_windows(&[w], &db, 20, 1010);
+        let resp = aggregate_windows(&[w], &db, 20, &[], 1010);
         let entry = &resp.vlans["10"].upload.asns[0];
         assert_eq!(entry.name, "Cloudflare");
         assert_eq!(entry.country, "US");
@@ -351,7 +356,7 @@ mod tests {
     fn test_aggregate_unknown_asn() {
         let db = make_asn_db(vec![]);
         let w = Arc::new(make_window(1000, vec![(10, vec![(99999, 100, 1)])], vec![]));
-        let resp = aggregate_windows(&[w], &db, 20, 1010);
+        let resp = aggregate_windows(&[w], &db, 20, &[], 1010);
         let entry = &resp.vlans["10"].upload.asns[0];
         assert_eq!(entry.name, "Unknown");
         assert_eq!(entry.country, "??");
@@ -388,15 +393,46 @@ mod tests {
         let w3 = Arc::new(make_window(1010, vec![(10, vec![(100, 300, 3)])], vec![]));
 
         // User A: 10s window → sees w2 + w3
-        let resp_10 = aggregate_windows(&[w2.clone(), w3.clone()], &db, 20, 1012);
+        let resp_10 = aggregate_windows(&[w2.clone(), w3.clone()], &db, 20, &[], 1012);
         let vlan = &resp_10.vlans["10"];
         assert_eq!(vlan.upload.total_bytes, 500); // 200 + 300
         assert_eq!(vlan.upload.total_flows, 5); // 2 + 3
 
         // User B: 20s window → sees w1 + w2 + w3
-        let resp_20 = aggregate_windows(&[w1, w2, w3], &db, 20, 1012);
+        let resp_20 = aggregate_windows(&[w1, w2, w3], &db, 20, &[], 1012);
         let vlan = &resp_20.vlans["10"];
         assert_eq!(vlan.upload.total_bytes, 600); // 100 + 200 + 300
         assert_eq!(vlan.upload.total_flows, 6); // 1 + 2 + 3
+    }
+
+    #[test]
+    fn test_skip_asns_excludes_from_totals_and_entries() {
+        let db = make_asn_db(vec![
+            (100, "MyASN", "PL"),
+            (200, "Cloudflare", "US"),
+            (300, "Google", "US"),
+        ]);
+        let w = Arc::new(make_window(
+            1000,
+            vec![(10, vec![(100, 5000, 50), (200, 500, 5), (300, 200, 2)])],
+            vec![(10, vec![(100, 4000, 40), (200, 300, 3)])],
+        ));
+
+        // Without skip: totals include ASN 100
+        let resp = aggregate_windows(&[w.clone()], &db, 20, &[], 1010);
+        let vlan = &resp.vlans["10"];
+        assert_eq!(vlan.upload.total_bytes, 5700);
+        assert_eq!(vlan.upload.asns.len(), 3);
+
+        // With skip: ASN 100 excluded from totals and entries
+        let resp = aggregate_windows(&[w], &db, 20, &[100], 1010);
+        let vlan = &resp.vlans["10"];
+        assert_eq!(vlan.upload.total_bytes, 700); // 500 + 200, not 5700
+        assert_eq!(vlan.upload.total_flows, 7); // 5 + 2, not 57
+        assert_eq!(vlan.upload.asns.len(), 2);
+        assert!(vlan.upload.asns.iter().all(|a| a.asn != 100));
+        assert_eq!(vlan.download.total_bytes, 300); // only Cloudflare
+        assert_eq!(vlan.download.asns.len(), 1);
+        assert_eq!(vlan.download.asns[0].asn, 200);
     }
 }

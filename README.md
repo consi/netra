@@ -25,6 +25,7 @@ Options:
   -f, --flow-port <FLOW_PORT>  UDP port for NetFlow/IPFIX packets [default: 2055]
   -p, --http-port <HTTP_PORT>  TCP port for the HTTP dashboard and SSE API [default: 1337]
   -d, --db-path <DB_PATH>      Path to the ASN database file [default: asndb.netra next to binary]
+      --skip-asns <ASN,ASN,...>  Exclude ASNs from charts and lists (comma-separated)
   -h, --help                   Print help
 ```
 
@@ -60,6 +61,31 @@ just check          # full CI pipeline
 ```bash
 docker build -t netra .
 docker run -p 1337:1337 -p 2055:2055/udp netra
+```
+
+## Excluding Your Own ASN
+
+When running netra on your router, your own ASN will dominate the charts. Use `--skip-asns` to exclude it:
+
+```bash
+netra --skip-asns 12345
+netra --skip-asns 12345,67890   # exclude multiple ASNs
+```
+
+To configure this in a systemd unit, edit the service with `systemctl edit netra` and override `ExecStart`:
+
+```ini
+# /etc/systemd/system/netra.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/netra --skip-asns 12345
+```
+
+Then reload and restart:
+
+```bash
+systemctl daemon-reload
+systemctl restart netra
 ```
 
 ## Architecture
