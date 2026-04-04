@@ -68,7 +68,8 @@ impl V9Parser {
         let _count = read_u16(data, 2); // number of records (across all flowsets)
         let sys_uptime = read_u32(data, 4) as u64;
         let unix_secs = read_u32(data, 8) as u64;
-        let source_id = read_u32(data, 12);
+        let _sequence = read_u32(data, 12);
+        let source_id = read_u32(data, 16);
 
         let wall_ms = unix_secs * 1000;
         let boot_epoch_ms = wall_ms.wrapping_sub(sys_uptime);
@@ -471,5 +472,153 @@ mod tests {
             Err(ParseError::BadVersion(5)) => {}
             other => panic!("expected BadVersion(5), got {other:?}"),
         }
+    }
+
+    /// Build a v9 header with the given sequence and source_id.
+    fn build_v9_header(
+        pkt: &mut Vec<u8>,
+        count: u16,
+        sys_uptime: u32,
+        unix_secs: u32,
+        sequence: u32,
+        source_id: u32,
+    ) {
+        pkt.extend_from_slice(&9u16.to_be_bytes());
+        pkt.extend_from_slice(&count.to_be_bytes());
+        pkt.extend_from_slice(&sys_uptime.to_be_bytes());
+        pkt.extend_from_slice(&unix_secs.to_be_bytes());
+        pkt.extend_from_slice(&sequence.to_be_bytes());
+        pkt.extend_from_slice(&source_id.to_be_bytes());
+    }
+
+    /// Regression test: template and data arrive in separate packets with different
+    /// sequence numbers (as Cisco devices do in practice). The v9 header has the
+    /// sequence number at offset 12 and source_id at offset 16 — reading the wrong
+    /// field causes every packet to get a unique cache key, so data-only packets
+    /// never find their template.
+    #[test]
+    fn test_template_and_data_in_separate_packets() {
+        let exporter = IpAddr::V4(Ipv4Addr::new(172, 16, 40, 1));
+        let mut parser = V9Parser::new();
+        let source_id: u32 = 768;
+        let sys_uptime: u32 = 60_000;
+        let unix_secs: u32 = 1_700_000_000;
+
+        // --- Packet 1: template only (sequence = 100) ---
+        let mut tmpl_pkt = Vec::new();
+        build_v9_header(&mut tmpl_pkt, 0, sys_uptime, unix_secs, 100, source_id);
+
+        let field_count: u16 = 6;
+        let tmpl_fields_len = (field_count as usize) * 4;
+        let tmpl_record_len = 4 + tmpl_fields_len;
+        let flowset_len = 4 + tmpl_record_len;
+        let flowset_len_padded = (flowset_len + 3) & !3;
+
+        tmpl_pkt.extend_from_slice(&0u16.to_be_bytes()); // template flowset
+        tmpl_pkt.extend_from_slice(&(flowset_len_padded as u16).to_be_bytes());
+        tmpl_pkt.extend_from_slice(&256u16.to_be_bytes()); // template_id
+        tmpl_pkt.extend_from_slice(&field_count.to_be_bytes());
+
+        // Fields: SRC_ADDR, DST_ADDR, IN_BYTES, FIRST_SWITCHED, LAST_SWITCHED, DST_VLAN
+        for &(ftype, flen) in &[(8, 4), (12, 4), (1, 4), (22, 4), (21, 4), (59, 2)] {
+            tmpl_pkt.extend_from_slice(&(ftype as u16).to_be_bytes());
+            tmpl_pkt.extend_from_slice(&(flen as u16).to_be_bytes());
+        }
+        while tmpl_pkt.len() < 20 + flowset_len_padded {
+            tmpl_pkt.push(0);
+        }
+
+        let mut flows = Vec::new();
+        parser.parse_into(&tmpl_pkt, exporter, &mut flows).unwrap();
+        assert!(
+            flows.is_empty(),
+            "template-only packet should produce no flows"
+        );
+
+        // --- Packet 2: data only (sequence = 101, same source_id) ---
+        let mut data_pkt = Vec::new();
+        build_v9_header(&mut data_pkt, 1, sys_uptime, unix_secs, 101, source_id);
+
+        let record_len = 22; // 4+4+4+4+4+2
+        let data_flowset_len = 4 + record_len;
+        let data_flowset_len_padded = (data_flowset_len + 3) & !3;
+
+        data_pkt.extend_from_slice(&256u16.to_be_bytes()); // flowset_id = template 256
+        data_pkt.extend_from_slice(&(data_flowset_len_padded as u16).to_be_bytes());
+        data_pkt.extend_from_slice(&Ipv4Addr::new(192, 168, 1, 1).octets());
+        data_pkt.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 1).octets());
+        data_pkt.extend_from_slice(&1500u32.to_be_bytes());
+        data_pkt.extend_from_slice(&30_000u32.to_be_bytes());
+        data_pkt.extend_from_slice(&55_000u32.to_be_bytes());
+        data_pkt.extend_from_slice(&100u16.to_be_bytes());
+        while data_pkt.len() < 20 + data_flowset_len_padded {
+            data_pkt.push(0);
+        }
+
+        flows.clear();
+        parser.parse_into(&data_pkt, exporter, &mut flows).unwrap();
+
+        assert_eq!(
+            flows.len(),
+            1,
+            "data packet must find template from earlier packet (same source_id)"
+        );
+        assert_eq!(flows[0].dst_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(flows[0].byte_count, 1500);
+        assert_eq!(flows[0].vlan_id, 100);
+    }
+
+    /// Verify templates are isolated per source_id — data from one source_id
+    /// must not match a template registered under a different source_id.
+    #[test]
+    fn test_different_source_ids_isolated() {
+        let exporter = IpAddr::V4(Ipv4Addr::new(172, 16, 40, 1));
+        let mut parser = V9Parser::new();
+        let sys_uptime: u32 = 60_000;
+        let unix_secs: u32 = 1_700_000_000;
+
+        // Register template under source_id=768
+        let mut tmpl_pkt = Vec::new();
+        build_v9_header(&mut tmpl_pkt, 0, sys_uptime, unix_secs, 200, 768);
+
+        let field_count: u16 = 3;
+        let flowset_len = 4 + 4 + (field_count as usize) * 4;
+        let flowset_len_padded = (flowset_len + 3) & !3;
+        tmpl_pkt.extend_from_slice(&0u16.to_be_bytes());
+        tmpl_pkt.extend_from_slice(&(flowset_len_padded as u16).to_be_bytes());
+        tmpl_pkt.extend_from_slice(&256u16.to_be_bytes());
+        tmpl_pkt.extend_from_slice(&field_count.to_be_bytes());
+        for &(ftype, flen) in &[(8, 4), (12, 4), (1, 4)] {
+            tmpl_pkt.extend_from_slice(&(ftype as u16).to_be_bytes());
+            tmpl_pkt.extend_from_slice(&(flen as u16).to_be_bytes());
+        }
+        while tmpl_pkt.len() < 20 + flowset_len_padded {
+            tmpl_pkt.push(0);
+        }
+        parser
+            .parse_into(&tmpl_pkt, exporter, &mut Vec::new())
+            .unwrap();
+
+        // Send data under source_id=1024 — should NOT match template from 768
+        let mut data_pkt = Vec::new();
+        build_v9_header(&mut data_pkt, 1, sys_uptime, unix_secs, 201, 1024);
+        let record_len = 12; // 4+4+4
+        let data_fs_len = 4 + record_len;
+        let data_fs_padded = (data_fs_len + 3) & !3;
+        data_pkt.extend_from_slice(&256u16.to_be_bytes());
+        data_pkt.extend_from_slice(&(data_fs_padded as u16).to_be_bytes());
+        data_pkt.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 1).octets());
+        data_pkt.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 2).octets());
+        data_pkt.extend_from_slice(&500u32.to_be_bytes());
+        while data_pkt.len() < 20 + data_fs_padded {
+            data_pkt.push(0);
+        }
+
+        let mut flows = Vec::new();
+        parser.parse_into(&data_pkt, exporter, &mut flows).unwrap();
+        assert!(
+            flows.is_empty(),
+            "data from source_id=1024 must not use template from source_id=768"
+        );
     }
 }
