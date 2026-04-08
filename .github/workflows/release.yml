@@ -20,7 +20,7 @@ jobs:
             os: ubuntu-latest
             arch: amd64
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             arch: arm64
 
     runs-on: ${{ matrix.os }}
@@ -46,12 +46,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
-            echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-            mkdir -p .cargo
-            printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' >> .cargo/config.toml
-          fi
 
       - name: Set version from tag
         run: |
