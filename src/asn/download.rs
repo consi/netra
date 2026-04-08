@@ -12,7 +12,17 @@ pub async fn download_and_build() -> Result<AsnDb, Box<dyn std::error::Error + S
     // Ensure ring crypto provider is installed for rustls (idempotent).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let resp = reqwest::get(TSV_URL).await?.error_for_status()?;
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let client = reqwest::Client::builder()
+        .use_preconfigured_tls(tls_config)
+        .build()?;
+
+    let resp = client.get(TSV_URL).send().await?.error_for_status()?;
     let bytes = resp.bytes().await?;
 
     let decoder = GzDecoder::new(&bytes[..]);

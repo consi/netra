@@ -60,11 +60,15 @@ async fn main() {
 
     // --- ASN database ---
     let db_path = args.db_path.unwrap_or_else(|| {
-        let exe_dir = std::env::current_exe()
+        let dir = std::env::current_dir()
             .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap());
-        exe_dir.join("asndb.netra")
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        dir.join("asndb.netra")
     });
 
     let asn_db_arc = match asn::init(&db_path).await {
