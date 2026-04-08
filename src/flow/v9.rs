@@ -41,14 +41,26 @@ struct ResolvedTemplate {
     sampling_interval: Option<FieldLoc>,
 }
 
+/// Describes the layout of an options template for extracting sampling interval.
+#[derive(Clone, Debug)]
+struct OptionsTemplate {
+    record_len: usize,
+    sampling_interval: Option<FieldLoc>,
+}
+
 pub struct V9Parser {
     templates: HashMap<(IpAddr, u32, u16), ResolvedTemplate>,
+    options_templates: HashMap<(IpAddr, u32, u16), OptionsTemplate>,
+    /// Per-(exporter, source_id) sampling rate learned from options data.
+    sampling_rates: HashMap<(IpAddr, u32), u64>,
 }
 
 impl V9Parser {
     pub fn new() -> Self {
         Self {
             templates: HashMap::new(),
+            options_templates: HashMap::new(),
+            sampling_rates: HashMap::new(),
         }
     }
 
@@ -102,18 +114,36 @@ impl V9Parser {
                     )?;
                 }
                 1 => {
-                    // Options Template FlowSet — skip
+                    // Options Template FlowSet
+                    self.parse_options_template_flowset(
+                        data,
+                        cursor + 4,
+                        flowset_end,
+                        exporter,
+                        source_id,
+                    )?;
                 }
                 id if id >= 256 => {
-                    // Data FlowSet
+                    // Data FlowSet — could be flow data or options data
                     let key = (exporter, source_id, id);
-                    if let Some(tmpl) = self.templates.get(&key).cloned() {
+                    if let Some(opts_tmpl) = self.options_templates.get(&key).cloned() {
+                        self.parse_options_data_flowset(
+                            data,
+                            cursor + 4,
+                            flowset_end,
+                            &opts_tmpl,
+                            exporter,
+                            source_id,
+                        );
+                    } else if let Some(tmpl) = self.templates.get(&key).cloned() {
                         self.parse_data_flowset(
                             data,
                             cursor + 4,
                             flowset_end,
                             &tmpl,
                             boot_epoch_ms,
+                            exporter,
+                            source_id,
                             flows,
                         );
                     }
@@ -128,6 +158,89 @@ impl V9Parser {
         }
 
         Ok(())
+    }
+
+    fn parse_options_template_flowset(
+        &mut self,
+        data: &[u8],
+        mut pos: usize,
+        end: usize,
+        exporter: IpAddr,
+        source_id: u32,
+    ) -> Result<(), ParseError> {
+        // v9 Options Template format:
+        //   template_id (2), option_scope_length (2), option_length (2)
+        //   then scope fields (option_scope_length bytes of type/len pairs)
+        //   then option fields (option_length bytes of type/len pairs)
+        while pos + 6 <= end {
+            let template_id = read_u16(data, pos);
+            let scope_length = read_u16(data, pos + 2) as usize;
+            let option_length = read_u16(data, pos + 4) as usize;
+            pos += 6;
+
+            let total_fields_bytes = scope_length + option_length;
+            if pos + total_fields_bytes > end {
+                return Err(ParseError::MalformedTemplate);
+            }
+
+            let mut sampling_loc: Option<FieldLoc> = None;
+            let mut offset = 0usize;
+
+            // Parse all fields (scope + option) as type(2)/length(2) pairs
+            let fields_end = pos + total_fields_bytes;
+            while pos + 4 <= fields_end {
+                let field_type = read_u16(data, pos);
+                let field_len = read_u16(data, pos + 2) as usize;
+                pos += 4;
+
+                if field_type == SAMPLING_INTERVAL || field_type == SAMPLING_PACKET_INTERVAL {
+                    sampling_loc = Some(FieldLoc {
+                        offset,
+                        length: field_len,
+                    });
+                }
+
+                offset += field_len;
+            }
+
+            self.options_templates.insert(
+                (exporter, source_id, template_id),
+                OptionsTemplate {
+                    record_len: offset,
+                    sampling_interval: sampling_loc,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn parse_options_data_flowset(
+        &mut self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        tmpl: &OptionsTemplate,
+        exporter: IpAddr,
+        source_id: u32,
+    ) {
+        if tmpl.record_len == 0 {
+            return;
+        }
+
+        let mut pos = start;
+        while pos + tmpl.record_len <= end {
+            let rec = &data[pos..pos + tmpl.record_len];
+
+            if let Some(loc) = &tmpl.sampling_interval {
+                let rate = read_uint(rec, loc.offset, loc.length);
+                if rate > 1 {
+                    self.sampling_rates.insert((exporter, source_id), rate);
+                }
+            }
+
+            pos += tmpl.record_len;
+        }
     }
 
     fn parse_template_flowset(
@@ -202,6 +315,7 @@ impl V9Parser {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_data_flowset(
         &self,
         data: &[u8],
@@ -209,11 +323,20 @@ impl V9Parser {
         end: usize,
         tmpl: &ResolvedTemplate,
         boot_epoch_ms: u64,
+        exporter: IpAddr,
+        source_id: u32,
         flows: &mut Vec<ExtractedFlow>,
     ) {
         if tmpl.record_len == 0 {
             return;
         }
+
+        let options_sampling = self
+            .sampling_rates
+            .get(&(exporter, source_id))
+            .copied()
+            .unwrap_or(1)
+            .max(1);
 
         let mut pos = start;
         while pos + tmpl.record_len <= end {
@@ -307,12 +430,13 @@ impl V9Parser {
                 (boot_epoch_ms + first_ms, boot_epoch_ms + last_ms)
             };
 
+            // Use inline sampling field if present, otherwise fall back to options-derived rate.
             let sampling_rate = tmpl
                 .sampling_interval
                 .as_ref()
                 .map(|loc| read_uint(rec, loc.offset, loc.length))
-                .unwrap_or(1)
-                .max(1);
+                .map(|v| v.max(1))
+                .unwrap_or(options_sampling);
 
             let byte_count = byte_count * sampling_rate;
             let packet_count = packet_count * sampling_rate;

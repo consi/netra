@@ -85,14 +85,27 @@ struct FieldIndices {
     sampling_interval: Option<usize>,
 }
 
+/// Describes the layout of an options template so we can extract the sampling interval
+/// from options data records.
+#[derive(Clone, Debug)]
+struct OptionsTemplate {
+    record_len: usize,
+    sampling_interval: Option<FieldLoc>,
+}
+
 pub struct IpfixParser {
     templates: HashMap<(IpAddr, u32, u16), (ResolvedIpfixTemplate, FieldIndices)>,
+    options_templates: HashMap<(IpAddr, u32, u16), OptionsTemplate>,
+    /// Per-(exporter, observation_domain) sampling rate learned from options data.
+    sampling_rates: HashMap<(IpAddr, u32), u64>,
 }
 
 impl IpfixParser {
     pub fn new() -> Self {
         Self {
             templates: HashMap::new(),
+            options_templates: HashMap::new(),
+            sampling_rates: HashMap::new(),
         }
     }
 
@@ -145,12 +158,29 @@ impl IpfixParser {
                     )?;
                 }
                 3 => {
-                    // Options Template Set — skip
+                    // Options Template Set
+                    self.parse_options_template_set(
+                        data,
+                        cursor + 4,
+                        set_end,
+                        exporter,
+                        observation_domain_id,
+                    )?;
                 }
                 id if id >= 256 => {
-                    // Data Set
+                    // Data Set — could be flow data or options data
                     let key = (exporter, observation_domain_id, id);
-                    if let Some((tmpl, indices)) = self.templates.get(&key).cloned() {
+                    if let Some(opts_tmpl) = self.options_templates.get(&key).cloned() {
+                        // Options data record — extract sampling rate
+                        self.parse_options_data_set(
+                            data,
+                            cursor + 4,
+                            set_end,
+                            &opts_tmpl,
+                            exporter,
+                            observation_domain_id,
+                        );
+                    } else if let Some((tmpl, indices)) = self.templates.get(&key).cloned() {
                         self.parse_data_set(
                             data,
                             cursor + 4,
@@ -158,6 +188,8 @@ impl IpfixParser {
                             &tmpl,
                             &indices,
                             export_time,
+                            exporter,
+                            observation_domain_id,
                             flows,
                         );
                     }
@@ -171,6 +203,99 @@ impl IpfixParser {
         }
 
         Ok(())
+    }
+
+    fn parse_options_template_set(
+        &mut self,
+        data: &[u8],
+        mut pos: usize,
+        end: usize,
+        exporter: IpAddr,
+        observation_domain_id: u32,
+    ) -> Result<(), ParseError> {
+        while pos + 6 <= end {
+            let template_id = read_u16(data, pos);
+            let total_field_count = read_u16(data, pos + 2) as usize;
+            let scope_field_count = read_u16(data, pos + 4) as usize;
+            pos += 6;
+            let _ = scope_field_count; // not needed for our purposes
+
+            let mut sampling_loc: Option<FieldLoc> = None;
+            let mut offset = 0usize;
+
+            for _ in 0..total_field_count {
+                if pos + 4 > end {
+                    return Err(ParseError::MalformedTemplate);
+                }
+
+                let raw_id = read_u16(data, pos);
+                let field_length = read_u16(data, pos + 2);
+                pos += 4;
+
+                let enterprise_bit = raw_id & 0x8000 != 0;
+                let element_id = raw_id & 0x7FFF;
+
+                if enterprise_bit {
+                    if pos + 4 > end {
+                        return Err(ParseError::MalformedTemplate);
+                    }
+                    pos += 4; // skip PEN
+                }
+
+                if !enterprise_bit
+                    && field_length != VARIABLE_LENGTH
+                    && (element_id == SAMPLING_INTERVAL || element_id == SAMPLING_PACKET_INTERVAL)
+                {
+                    sampling_loc = Some(FieldLoc {
+                        offset,
+                        length: field_length as usize,
+                    });
+                }
+
+                if field_length != VARIABLE_LENGTH {
+                    offset += field_length as usize;
+                }
+            }
+
+            self.options_templates.insert(
+                (exporter, observation_domain_id, template_id),
+                OptionsTemplate {
+                    record_len: offset,
+                    sampling_interval: sampling_loc,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn parse_options_data_set(
+        &mut self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        tmpl: &OptionsTemplate,
+        exporter: IpAddr,
+        observation_domain_id: u32,
+    ) {
+        if tmpl.record_len == 0 {
+            return;
+        }
+
+        let mut pos = start;
+        while pos + tmpl.record_len <= end {
+            let rec = &data[pos..pos + tmpl.record_len];
+
+            if let Some(loc) = &tmpl.sampling_interval {
+                let rate = read_uint(rec, loc.offset, loc.length);
+                if rate > 1 {
+                    self.sampling_rates
+                        .insert((exporter, observation_domain_id), rate);
+                }
+            }
+
+            pos += tmpl.record_len;
+        }
     }
 
     fn parse_template_set(
@@ -334,16 +459,36 @@ impl IpfixParser {
         tmpl: &ResolvedIpfixTemplate,
         indices: &FieldIndices,
         export_time: u64,
+        exporter: IpAddr,
+        observation_domain_id: u32,
         flows: &mut Vec<ExtractedFlow>,
     ) {
+        // Fallback sampling rate from options data, used when data records lack inline sampling.
+        let options_sampling = self
+            .sampling_rates
+            .get(&(exporter, observation_domain_id))
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+
         if tmpl.has_variable_fields {
-            self.parse_data_set_variable(data, start, end, tmpl, indices, export_time, flows);
+            self.parse_data_set_variable(
+                data,
+                start,
+                end,
+                tmpl,
+                indices,
+                export_time,
+                options_sampling,
+                flows,
+            );
         } else {
-            self.parse_data_set_fixed(data, start, end, tmpl, export_time, flows);
+            self.parse_data_set_fixed(data, start, end, tmpl, export_time, options_sampling, flows);
         }
     }
 
     /// Fast path: all fields are fixed-length, offsets precomputed.
+    #[allow(clippy::too_many_arguments)]
     fn parse_data_set_fixed(
         &self,
         data: &[u8],
@@ -351,6 +496,7 @@ impl IpfixParser {
         end: usize,
         tmpl: &ResolvedIpfixTemplate,
         export_time: u64,
+        options_sampling: u64,
         flows: &mut Vec<ExtractedFlow>,
     ) {
         if tmpl.record_len == 0 {
@@ -361,7 +507,7 @@ impl IpfixParser {
         while pos + tmpl.record_len <= end {
             let rec = &data[pos..pos + tmpl.record_len];
 
-            if let Some(flow) = self.extract_flow_fixed(rec, tmpl, export_time) {
+            if let Some(flow) = self.extract_flow_fixed(rec, tmpl, export_time, options_sampling) {
                 flows.push(flow);
             }
 
@@ -374,18 +520,20 @@ impl IpfixParser {
         rec: &[u8],
         tmpl: &ResolvedIpfixTemplate,
         export_time: u64,
+        options_sampling: u64,
     ) -> Option<ExtractedFlow> {
         let dst_ip = self.extract_ip(rec, &tmpl.dst_ipv6, &tmpl.dst_ipv4)?;
         let src_ip = self
             .extract_ip(rec, &tmpl.src_ipv6, &tmpl.src_ipv4)
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
+        // Use inline sampling field if present, otherwise fall back to options-derived rate.
         let sampling_rate = tmpl
             .sampling_interval
             .as_ref()
             .map(|loc| read_uint(rec, loc.offset, loc.length))
-            .unwrap_or(1)
-            .max(1);
+            .map(|v| v.max(1))
+            .unwrap_or(options_sampling);
 
         let byte_count = tmpl
             .in_bytes
@@ -501,6 +649,7 @@ impl IpfixParser {
         tmpl: &ResolvedIpfixTemplate,
         indices: &FieldIndices,
         export_time: u64,
+        options_sampling: u64,
         flows: &mut Vec<ExtractedFlow>,
     ) {
         let mut pos = start;
@@ -589,8 +738,8 @@ impl IpfixParser {
                     let (off, len) = field_offsets[idx];
                     read_uint(data, off, len)
                 })
-                .unwrap_or(1)
-                .max(1);
+                .map(|v| v.max(1))
+                .unwrap_or(options_sampling);
 
             let byte_count = indices
                 .in_bytes
@@ -1005,5 +1154,348 @@ mod tests {
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].byte_count, 1000 * 100);
         assert_eq!(flows[0].packet_count, 5 * 100);
+    }
+
+    #[test]
+    fn test_options_template_sampling() {
+        // Simulate the common pattern: sampling rate is in an Options Template/Data,
+        // not in the data template itself.
+        let mut pkt = Vec::new();
+        let export_time: u32 = 1_700_000_000;
+        let observation_domain_id: u32 = 42;
+
+        // Header
+        pkt.extend_from_slice(&10u16.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // length placeholder
+        pkt.extend_from_slice(&export_time.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        pkt.extend_from_slice(&observation_domain_id.to_be_bytes());
+
+        // --- Data Template (set_id=2): id=256, fields: IPV4_DST_ADDR, IN_BYTES, IN_PACKETS ---
+        let field_count: u16 = 3;
+        let set_len = 4 + 4 + (field_count as usize) * 4;
+        let set_len_padded = (set_len + 3) & !3;
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&(set_len_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&256u16.to_be_bytes());
+        pkt.extend_from_slice(&field_count.to_be_bytes());
+        pkt.extend_from_slice(&12u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        while pkt.len() < HEADER_LEN + set_len_padded {
+            pkt.push(0);
+        }
+        let after_tmpl = pkt.len();
+
+        // --- Options Template (set_id=3): id=512, scope: 1 field, option: SAMPLING_INTERVAL ---
+        // scope field: some scope (e.g., id=144/exporterIPv4, len=4)
+        // option field: SAMPLING_INTERVAL (id=34, len=4)
+        let opts_total_fields: u16 = 2;
+        let opts_scope_fields: u16 = 1;
+        let opts_set_len = 4 + 6 + (opts_total_fields as usize) * 4; // set hdr + tmpl hdr + fields
+        let opts_set_len_padded = (opts_set_len + 3) & !3;
+        pkt.extend_from_slice(&3u16.to_be_bytes());
+        pkt.extend_from_slice(&(opts_set_len_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&512u16.to_be_bytes());
+        pkt.extend_from_slice(&opts_total_fields.to_be_bytes());
+        pkt.extend_from_slice(&opts_scope_fields.to_be_bytes());
+        // Scope field: id=144, len=4
+        pkt.extend_from_slice(&144u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        // Option field: SAMPLING_INTERVAL id=34, len=4
+        pkt.extend_from_slice(&34u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes());
+        while pkt.len() < after_tmpl + opts_set_len_padded {
+            pkt.push(0);
+        }
+        let after_opts_tmpl = pkt.len();
+
+        // --- Options Data (set_id=512): record = scope(4) + sampling(4) = 8 bytes ---
+        let opts_record_len = 8;
+        let opts_data_set_len = 4 + opts_record_len;
+        let opts_data_set_padded = (opts_data_set_len + 3) & !3;
+        pkt.extend_from_slice(&512u16.to_be_bytes());
+        pkt.extend_from_slice(&(opts_data_set_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes()); // scope value (don't care)
+        pkt.extend_from_slice(&1024u32.to_be_bytes()); // sampling interval = 1024
+        while pkt.len() < after_opts_tmpl + opts_data_set_padded {
+            pkt.push(0);
+        }
+        let after_opts_data = pkt.len();
+
+        // --- Data Set (set_id=256): record = dst_ip(4) + in_bytes(4) + in_packets(4) = 12 ---
+        let record_len = 12;
+        let data_set_len = 4 + record_len;
+        let data_set_padded = (data_set_len + 3) & !3;
+        pkt.extend_from_slice(&256u16.to_be_bytes());
+        pkt.extend_from_slice(&(data_set_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&Ipv4Addr::new(10, 1, 1, 1).octets());
+        pkt.extend_from_slice(&500u32.to_be_bytes());
+        pkt.extend_from_slice(&5u32.to_be_bytes());
+        while pkt.len() < after_opts_data + data_set_padded {
+            pkt.push(0);
+        }
+
+        // Fill in message length
+        let total_len = pkt.len() as u16;
+        pkt[2] = total_len.to_be_bytes()[0];
+        pkt[3] = total_len.to_be_bytes()[1];
+
+        let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut parser = IpfixParser::new();
+        let mut flows = Vec::new();
+        parser.parse_into(&pkt, exporter, &mut flows).unwrap();
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].byte_count, 500 * 1024);
+        assert_eq!(flows[0].packet_count, 5 * 1024);
+    }
+
+    #[test]
+    fn test_options_sampling_across_packets() {
+        // Options data arrives in a separate packet before data flows.
+        let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let observation_domain_id: u32 = 42;
+        let export_time: u32 = 1_700_000_000;
+        let mut parser = IpfixParser::new();
+
+        // Packet 1: data template + options template + options data
+        let mut pkt1 = Vec::new();
+        pkt1.extend_from_slice(&10u16.to_be_bytes());
+        pkt1.extend_from_slice(&0u16.to_be_bytes());
+        pkt1.extend_from_slice(&export_time.to_be_bytes());
+        pkt1.extend_from_slice(&0u32.to_be_bytes());
+        pkt1.extend_from_slice(&observation_domain_id.to_be_bytes());
+
+        // Data template: id=256, fields: IPV4_DST_ADDR(4), IN_BYTES(4)
+        let tmpl_set_len = 4 + 4 + 2 * 4; // 16
+        let tmpl_set_padded = (tmpl_set_len + 3) & !3;
+        pkt1.extend_from_slice(&2u16.to_be_bytes());
+        pkt1.extend_from_slice(&(tmpl_set_padded as u16).to_be_bytes());
+        pkt1.extend_from_slice(&256u16.to_be_bytes());
+        pkt1.extend_from_slice(&2u16.to_be_bytes());
+        pkt1.extend_from_slice(&12u16.to_be_bytes());
+        pkt1.extend_from_slice(&4u16.to_be_bytes());
+        pkt1.extend_from_slice(&1u16.to_be_bytes());
+        pkt1.extend_from_slice(&4u16.to_be_bytes());
+        while pkt1.len() < HEADER_LEN + tmpl_set_padded {
+            pkt1.push(0);
+        }
+        let p1 = pkt1.len();
+
+        // Options template: id=512, 1 scope + 1 option (SAMPLING_INTERVAL)
+        let opts_set_len = 4 + 6 + 2 * 4;
+        let opts_set_padded = (opts_set_len + 3) & !3;
+        pkt1.extend_from_slice(&3u16.to_be_bytes());
+        pkt1.extend_from_slice(&(opts_set_padded as u16).to_be_bytes());
+        pkt1.extend_from_slice(&512u16.to_be_bytes());
+        pkt1.extend_from_slice(&2u16.to_be_bytes());
+        pkt1.extend_from_slice(&1u16.to_be_bytes());
+        pkt1.extend_from_slice(&144u16.to_be_bytes());
+        pkt1.extend_from_slice(&4u16.to_be_bytes());
+        pkt1.extend_from_slice(&34u16.to_be_bytes());
+        pkt1.extend_from_slice(&4u16.to_be_bytes());
+        while pkt1.len() < p1 + opts_set_padded {
+            pkt1.push(0);
+        }
+        let p2 = pkt1.len();
+
+        // Options data: scope(4) + sampling(4) = 8
+        let opts_data_len = 4 + 8;
+        let opts_data_padded = (opts_data_len + 3) & !3;
+        pkt1.extend_from_slice(&512u16.to_be_bytes());
+        pkt1.extend_from_slice(&(opts_data_padded as u16).to_be_bytes());
+        pkt1.extend_from_slice(&0u32.to_be_bytes());
+        pkt1.extend_from_slice(&512u32.to_be_bytes()); // sampling = 512
+        while pkt1.len() < p2 + opts_data_padded {
+            pkt1.push(0);
+        }
+
+        let len1 = pkt1.len() as u16;
+        pkt1[2] = len1.to_be_bytes()[0];
+        pkt1[3] = len1.to_be_bytes()[1];
+
+        let mut flows = Vec::new();
+        parser.parse_into(&pkt1, exporter, &mut flows).unwrap();
+        assert!(flows.is_empty());
+
+        // Packet 2: data only
+        let mut pkt2 = Vec::new();
+        pkt2.extend_from_slice(&10u16.to_be_bytes());
+        pkt2.extend_from_slice(&0u16.to_be_bytes());
+        pkt2.extend_from_slice(&export_time.to_be_bytes());
+        pkt2.extend_from_slice(&1u32.to_be_bytes()); // different sequence
+        pkt2.extend_from_slice(&observation_domain_id.to_be_bytes());
+
+        let data_set_len = 4 + 8; // dst_ip(4) + in_bytes(4)
+        let data_set_padded = (data_set_len + 3) & !3;
+        pkt2.extend_from_slice(&256u16.to_be_bytes());
+        pkt2.extend_from_slice(&(data_set_padded as u16).to_be_bytes());
+        pkt2.extend_from_slice(&Ipv4Addr::new(10, 1, 1, 1).octets());
+        pkt2.extend_from_slice(&200u32.to_be_bytes());
+        while pkt2.len() < HEADER_LEN + data_set_padded {
+            pkt2.push(0);
+        }
+
+        let len2 = pkt2.len() as u16;
+        pkt2[2] = len2.to_be_bytes()[0];
+        pkt2[3] = len2.to_be_bytes()[1];
+
+        flows.clear();
+        parser.parse_into(&pkt2, exporter, &mut flows).unwrap();
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].byte_count, 200 * 512);
+    }
+
+    /// Regression test using real IPFIX payloads from a router with 1:1024 sampling.
+    /// The sampling rate is conveyed via Options Template (set_id=3) / Options Data (set_id=512),
+    /// not inline in data records. Template 256 has no sampling field at all.
+    #[test]
+    fn test_real_ipfix_data_options_sampling_1024() {
+        let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 48, 204));
+        let mut parser = IpfixParser::new();
+
+        // Packet 1: Data template (set_id=2, template 256 with 29 fields, no sampling field).
+        let tmpl_pkt: &[u8] = &[
+            0x00, 0x0a, 0x00, 0x8c, 0x69, 0xd6, 0xa1, 0xfa, 0x5a, 0x29, 0xcd, 0x81, 0x00, 0x08,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x7c, 0x01, 0x00, 0x00, 0x1d, 0x00, 0x08, 0x00, 0x04,
+            0x00, 0x0c, 0x00, 0x04, 0x00, 0x05, 0x00, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00, 0x07,
+            0x00, 0x02, 0x00, 0x0b, 0x00, 0x02, 0x00, 0x20, 0x00, 0x02, 0x00, 0x0a, 0x00, 0x04,
+            0x00, 0x3a, 0x00, 0x02, 0x00, 0x09, 0x00, 0x01, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x10,
+            0x00, 0x04, 0x00, 0x11, 0x00, 0x04, 0x00, 0x0f, 0x00, 0x04, 0x00, 0x06, 0x00, 0x01,
+            0x00, 0x0e, 0x00, 0x04, 0x00, 0x34, 0x00, 0x01, 0x00, 0x35, 0x00, 0x01, 0x00, 0x88,
+            0x00, 0x01, 0x00, 0x3c, 0x00, 0x01, 0x00, 0x12, 0x00, 0x04, 0x00, 0x3d, 0x00, 0x01,
+            0x00, 0xf3, 0x00, 0x02, 0x00, 0xf5, 0x00, 0x02, 0x00, 0x36, 0x00, 0x04, 0x00, 0x01,
+            0x00, 0x08, 0x00, 0x02, 0x00, 0x08, 0x00, 0x98, 0x00, 0x08, 0x00, 0x99, 0x00, 0x08,
+        ];
+
+        let mut flows = Vec::new();
+        parser.parse_into(tmpl_pkt, exporter, &mut flows).unwrap();
+        assert!(flows.is_empty());
+
+        // Packet 2: Options Template (set_id=3, template 512) — defines where sampling lives.
+        let opts_tmpl_pkt: &[u8] = &[
+            0x00, 0x0a, 0x00, 0x48, 0x69, 0xd6, 0xa1, 0xfa, 0x00, 0x07, 0x04, 0x3d, 0x00, 0x08,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x38, 0x02, 0x00, 0x00, 0x0b, 0x00, 0x01, 0x00, 0x90,
+            0x00, 0x04, 0x00, 0x29, 0x00, 0x08, 0x00, 0x2a, 0x00, 0x08, 0x00, 0xa0, 0x00, 0x08,
+            0x00, 0x82, 0x00, 0x04, 0x00, 0x83, 0x00, 0x10, 0x00, 0x22, 0x00, 0x04, 0x00, 0x24,
+            0x00, 0x02, 0x00, 0x25, 0x00, 0x02, 0x00, 0xd6, 0x00, 0x01, 0x00, 0xd7, 0x00, 0x01,
+            0x00, 0x00, // padding
+        ];
+
+        parser
+            .parse_into(opts_tmpl_pkt, exporter, &mut flows)
+            .unwrap();
+        assert!(flows.is_empty());
+
+        // Packet 3: Options Data (set_id=512) — carries sampling_interval=1024.
+        let opts_data_pkt: &[u8] = &[
+            0x00, 0x0a, 0x00, 0x50, 0x69, 0xd6, 0xa2, 0x0b, 0x00, 0x07, 0x04, 0x3d, 0x00, 0x08,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01,
+            0x7e, 0xf7, 0x95, 0xa2, 0x00, 0x00, 0x00, 0x05, 0xf6, 0xbd, 0xa6, 0x71, 0x00, 0x00,
+            0x01, 0x9a, 0x37, 0xe1, 0x46, 0xf0, 0x0a, 0x00, 0x30, 0xcc, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x04, 0x00, // SAMPLING_INTERVAL = 0x400 = 1024
+            0x00, 0x0a, 0x00, 0x0a, 0x0a, 0x11, 0x00, 0x00, // padding
+        ];
+
+        parser
+            .parse_into(opts_data_pkt, exporter, &mut flows)
+            .unwrap();
+        assert!(flows.is_empty());
+        assert_eq!(
+            parser.sampling_rates.get(&(exporter, 0x00080000)),
+            Some(&1024u64),
+            "sampling rate 1024 must be learned from options data"
+        );
+
+        // Packet 4: Data flow (set_id=256) — first record: src=89.44.168.109, dst=193.19.165.106,
+        // in_bytes=1500, in_packets=1. Should be multiplied by 1024.
+        let data_pkt: &[u8] = &[
+            0x00, 0x0a, 0x01, 0x7c, 0x69, 0xd6, 0xa1, 0xf9, 0x5a, 0x29, 0xcd, 0x81, 0x00, 0x08,
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x6c, // Record 1 (90 bytes):
+            0x59, 0x2c, 0xa8, 0x6d, // src: 89.44.168.109
+            0xc1, 0x13, 0xa5, 0x6a, // dst: 193.19.165.106
+            0x28, // TOS
+            0x06, // proto TCP
+            0x01, 0xbb, // src_port 443
+            0xf4, 0xe6, // dst_port 62694
+            0x00, 0x00, // icmp type
+            0x00, 0x00, 0x02, 0x62, // input snmp
+            0x01, 0x36, // src_vlan 310
+            0x18, // src prefix
+            0x16, // dst prefix
+            0x00, 0x03, 0x19, 0x2f, // bgp_src_as
+            0x00, 0x00, 0x89, 0x7f, // bgp_dst_as
+            0xc1, 0x5b, 0x05, 0xf7, // next_hop
+            0x18, // tcp_flags
+            0x00, 0x00, 0x02, 0x81, // output snmp
+            0x36, // min_ttl
+            0x36, // max_ttl
+            0x02, // flow_end_reason
+            0x04, // ip_version
+            0xc1, 0x5b, 0x05, 0xf7, // unknown(18)
+            0xff, // direction
+            0x00, 0x00, // unknown(243)
+            0x00, 0x00, // unknown(245)
+            0x00, 0x00, 0x00, 0x00, // unknown(54)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0xdc, // in_bytes = 1500
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // in_packets = 1
+            0x00, 0x00, 0x01, 0x9d, 0x6e, 0x68, 0x61, 0x00, // flow_start_ms
+            0x00, 0x00, 0x01, 0x9d, 0x6e, 0x68, 0xa2, 0x00, // flow_end_ms
+            // Record 2:
+            0x03, 0x05, 0x7a, 0x71, 0x6d, 0x5f, 0x8f, 0x3f, 0x00, 0x06, 0x01, 0xbb, 0xb6, 0xbf,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x38, 0x02, 0x68, 0x18, 0x17, 0x00, 0x00, 0x40, 0x7d,
+            0x00, 0x00, 0xac, 0x36, 0xc1, 0x5b, 0x05, 0xcb, 0x10, 0x00, 0x00, 0x02, 0xad, 0xfa,
+            0xfa, 0x02, 0x04, 0xc1, 0x5b, 0x05, 0xcb, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0xc8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x9d, 0x6e, 0x68, 0x8e, 0x00, 0x00, 0x00,
+            0x01, 0x9d, 0x6e, 0x68, 0x8e, 0x00, // Record 3:
+            0x68, 0x12, 0x04, 0xf6, 0xb9, 0x1d, 0x0c, 0xaf, 0x00, 0x06, 0x01, 0xbb, 0x9b, 0x78,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x38, 0x02, 0x68, 0x14, 0x16, 0x00, 0x00, 0x34, 0x17,
+            0x00, 0x00, 0xec, 0xad, 0xc1, 0x5b, 0x05, 0xdb, 0x18, 0x00, 0x00, 0x02, 0x6b, 0x3e,
+            0x3e, 0x02, 0x04, 0xc1, 0x5b, 0x05, 0xa7, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x9d, 0x6e, 0x68, 0x88, 0x00, 0x00, 0x00,
+            0x01, 0x9d, 0x6e, 0x68, 0x88, 0x00, // Record 4:
+            0x95, 0x38, 0xf0, 0x46, 0xb9, 0x87, 0xc2, 0xac, 0x18, 0x06, 0x01, 0xbb, 0xe2, 0x24,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x38, 0x02, 0x68, 0x10, 0x18, 0x00, 0x00, 0x3f, 0x94,
+            0x00, 0x00, 0xe8, 0x44, 0xc1, 0x5b, 0x05, 0xff, 0x10, 0x00, 0x00, 0x02, 0xa1, 0x35,
+            0x35, 0x02, 0x04, 0xc1, 0x5b, 0x05, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0xa8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, 0x9d, 0x6e, 0x67, 0xc6, 0x00, 0x00, 0x00,
+            0x01, 0x9d, 0x6e, 0x68, 0x9e, 0x00,
+        ];
+
+        flows.clear();
+        parser.parse_into(data_pkt, exporter, &mut flows).unwrap();
+
+        assert_eq!(flows.len(), 4, "should parse 4 data records");
+
+        // Record 1: in_bytes=1500, in_packets=1, multiplied by 1024
+        let f = &flows[0];
+        assert_eq!(f.src_ip, IpAddr::V4(Ipv4Addr::new(89, 44, 168, 109)));
+        assert_eq!(f.dst_ip, IpAddr::V4(Ipv4Addr::new(193, 19, 165, 106)));
+        assert_eq!(f.byte_count, 1500 * 1024);
+        assert_eq!(f.packet_count, 1 * 1024);
+        assert_eq!(f.vlan_id, 310);
+
+        // All records should have sampling applied
+        for (i, f) in flows.iter().enumerate() {
+            assert!(
+                f.byte_count > 0 && f.byte_count % 1024 == 0,
+                "record {i}: byte_count {} should be a multiple of 1024",
+                f.byte_count,
+            );
+            assert!(
+                f.packet_count > 0 && f.packet_count % 1024 == 0,
+                "record {i}: packet_count {} should be a multiple of 1024",
+                f.packet_count,
+            );
+        }
     }
 }
