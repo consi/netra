@@ -14,8 +14,10 @@ const IPV6_SRC_ADDR: u16 = 27;
 const IPV6_DST_ADDR: u16 = 28;
 const LAST_SWITCHED: u16 = 21;
 const FIRST_SWITCHED: u16 = 22;
+const SAMPLING_INTERVAL: u16 = 34;
 const SRC_VLAN: u16 = 58;
 const DST_VLAN: u16 = 59;
+const SAMPLING_PACKET_INTERVAL: u16 = 305;
 
 #[derive(Clone, Debug)]
 struct FieldLoc {
@@ -36,6 +38,7 @@ struct ResolvedTemplate {
     last_switched: Option<FieldLoc>,
     src_vlan: Option<FieldLoc>,
     dst_vlan: Option<FieldLoc>,
+    sampling_interval: Option<FieldLoc>,
 }
 
 pub struct V9Parser {
@@ -157,6 +160,7 @@ impl V9Parser {
                 last_switched: None,
                 src_vlan: None,
                 dst_vlan: None,
+                sampling_interval: None,
             };
 
             let mut offset = 0usize;
@@ -181,6 +185,9 @@ impl V9Parser {
                     LAST_SWITCHED => tmpl.last_switched = Some(loc),
                     SRC_VLAN => tmpl.src_vlan = Some(loc),
                     DST_VLAN => tmpl.dst_vlan = Some(loc),
+                    SAMPLING_INTERVAL | SAMPLING_PACKET_INTERVAL => {
+                        tmpl.sampling_interval = Some(loc)
+                    }
                     _ => {}
                 }
 
@@ -299,6 +306,16 @@ impl V9Parser {
             } else {
                 (boot_epoch_ms + first_ms, boot_epoch_ms + last_ms)
             };
+
+            let sampling_rate = tmpl
+                .sampling_interval
+                .as_ref()
+                .map(|loc| read_uint(rec, loc.offset, loc.length))
+                .unwrap_or(1)
+                .max(1);
+
+            let byte_count = byte_count * sampling_rate;
+            let packet_count = packet_count * sampling_rate;
 
             let vlan_id = tmpl
                 .dst_vlan
@@ -620,5 +637,61 @@ mod tests {
             flows.is_empty(),
             "data from source_id=1024 must not use template from source_id=768"
         );
+    }
+
+    #[test]
+    fn test_sampling_interval() {
+        let exporter = IpAddr::V4(Ipv4Addr::new(172, 16, 40, 1));
+        let mut parser = V9Parser::new();
+        let source_id: u32 = 1;
+        let sys_uptime: u32 = 60_000;
+        let unix_secs: u32 = 1_700_000_000;
+
+        // Template with SAMPLING_INTERVAL (field 34) added
+        let mut pkt = Vec::new();
+        build_v9_header(&mut pkt, 0, sys_uptime, unix_secs, 1, source_id);
+
+        let field_count: u16 = 5; // SRC, DST, IN_BYTES, IN_PACKETS, SAMPLING_INTERVAL
+        let tmpl_fields_len = (field_count as usize) * 4;
+        let tmpl_record_len = 4 + tmpl_fields_len;
+        let flowset_len = 4 + tmpl_record_len;
+        let flowset_len_padded = (flowset_len + 3) & !3;
+
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&(flowset_len_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&256u16.to_be_bytes());
+        pkt.extend_from_slice(&field_count.to_be_bytes());
+
+        // Fields: SRC_ADDR(4), DST_ADDR(4), IN_BYTES(4), IN_PACKETS(4), SAMPLING_INTERVAL(4)
+        for &(ftype, flen) in &[(8, 4), (12, 4), (1, 4), (2, 4), (34, 4)] {
+            pkt.extend_from_slice(&(ftype as u16).to_be_bytes());
+            pkt.extend_from_slice(&(flen as u16).to_be_bytes());
+        }
+        while pkt.len() < 20 + flowset_len_padded {
+            pkt.push(0);
+        }
+
+        // Data flowset: record = 4+4+4+4+4 = 20 bytes
+        let record_len = 20;
+        let data_fs_len = 4 + record_len;
+        let data_fs_padded = (data_fs_len + 3) & !3;
+
+        pkt.extend_from_slice(&256u16.to_be_bytes());
+        pkt.extend_from_slice(&(data_fs_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&Ipv4Addr::new(192, 168, 1, 1).octets()); // src
+        pkt.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 1).octets()); // dst
+        pkt.extend_from_slice(&500u32.to_be_bytes()); // in_bytes
+        pkt.extend_from_slice(&10u32.to_be_bytes()); // in_packets
+        pkt.extend_from_slice(&200u32.to_be_bytes()); // sampling_interval = 1:200
+        while pkt.len() < 20 + flowset_len_padded + data_fs_padded {
+            pkt.push(0);
+        }
+
+        let mut flows = Vec::new();
+        parser.parse_into(&pkt, exporter, &mut flows).unwrap();
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].byte_count, 500 * 200);
+        assert_eq!(flows[0].packet_count, 10 * 200);
     }
 }

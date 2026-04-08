@@ -1,7 +1,6 @@
-FROM gcr.io/distroless/cc-debian13:nonroot
+FROM scratch
 ARG BINARY=target/release/netra
 COPY ${BINARY} /netra
 EXPOSE 1337/tcp
 EXPOSE 2055/udp
-USER nonroot
 ENTRYPOINT ["/netra"]

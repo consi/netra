@@ -17,10 +17,12 @@ const IPV6_SRC_ADDR: u16 = 27;
 const IPV6_DST_ADDR: u16 = 28;
 const SRC_VLAN: u16 = 58;
 const DST_VLAN: u16 = 59;
+const SAMPLING_INTERVAL: u16 = 34;
 const FLOW_START_SEC: u16 = 150;
 const FLOW_END_SEC: u16 = 151;
 const FLOW_START_MS: u16 = 152;
 const FLOW_END_MS: u16 = 153;
+const SAMPLING_PACKET_INTERVAL: u16 = 305;
 
 /// Marker for variable-length field in IPFIX templates.
 const VARIABLE_LENGTH: u16 = 65535;
@@ -60,6 +62,7 @@ struct ResolvedIpfixTemplate {
     flow_end_sec: Option<FieldLoc>,
     flow_start_ms: Option<FieldLoc>,
     flow_end_ms: Option<FieldLoc>,
+    sampling_interval: Option<FieldLoc>,
 }
 
 /// Index into the `fields` vec for fields we care about (to resolve at runtime for variable-length records).
@@ -79,6 +82,7 @@ struct FieldIndices {
     flow_end_sec: Option<usize>,
     flow_start_ms: Option<usize>,
     flow_end_ms: Option<usize>,
+    sampling_interval: Option<usize>,
 }
 
 pub struct IpfixParser {
@@ -200,6 +204,7 @@ impl IpfixParser {
                 flow_end_sec: None,
                 flow_start_ms: None,
                 flow_end_ms: None,
+                sampling_interval: None,
             };
 
             let mut indices = FieldIndices::default();
@@ -297,6 +302,10 @@ impl IpfixParser {
                             tmpl.flow_end_ms = Some(loc);
                             indices.flow_end_ms = Some(field_idx);
                         }
+                        SAMPLING_INTERVAL | SAMPLING_PACKET_INTERVAL => {
+                            tmpl.sampling_interval = Some(loc);
+                            indices.sampling_interval = Some(field_idx);
+                        }
                         _ => {}
                     }
                 }
@@ -371,17 +380,26 @@ impl IpfixParser {
             .extract_ip(rec, &tmpl.src_ipv6, &tmpl.src_ipv4)
             .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
+        let sampling_rate = tmpl
+            .sampling_interval
+            .as_ref()
+            .map(|loc| read_uint(rec, loc.offset, loc.length))
+            .unwrap_or(1)
+            .max(1);
+
         let byte_count = tmpl
             .in_bytes
             .as_ref()
             .map(|loc| read_uint(rec, loc.offset, loc.length))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            * sampling_rate;
 
         let packet_count = tmpl
             .in_packets
             .as_ref()
             .map(|loc| read_uint(rec, loc.offset, loc.length))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            * sampling_rate;
 
         let (flow_start_ms, flow_end_ms) = self.resolve_timestamps_ms(rec, tmpl, export_time);
 
@@ -565,13 +583,23 @@ impl IpfixParser {
             let src_ip = extract_ip_var(indices.src_ipv6, indices.src_ipv4)
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
+            let sampling_rate = indices
+                .sampling_interval
+                .map(|idx| {
+                    let (off, len) = field_offsets[idx];
+                    read_uint(data, off, len)
+                })
+                .unwrap_or(1)
+                .max(1);
+
             let byte_count = indices
                 .in_bytes
                 .map(|idx| {
                     let (off, len) = field_offsets[idx];
                     read_uint(data, off, len)
                 })
-                .unwrap_or(0);
+                .unwrap_or(0)
+                * sampling_rate;
 
             let packet_count = indices
                 .in_packets
@@ -579,7 +607,8 @@ impl IpfixParser {
                     let (off, len) = field_offsets[idx];
                     read_uint(data, off, len)
                 })
-                .unwrap_or(0);
+                .unwrap_or(0)
+                * sampling_rate;
 
             // Timestamps — build temporary FieldLoc from actual offsets for reuse.
             let mk_loc = |idx: Option<usize>| -> Option<FieldLoc> {
@@ -612,6 +641,7 @@ impl IpfixParser {
                 flow_end_sec: mk_loc(indices.flow_end_sec),
                 flow_start_ms: mk_loc(indices.flow_start_ms),
                 flow_end_ms: mk_loc(indices.flow_end_ms),
+                sampling_interval: None,
             };
 
             let rec_data = &data[rec_start..pos];
@@ -908,5 +938,72 @@ mod tests {
         let end = f.flow_end_ms as u128;
         assert_eq!(end, 1_700_000_060_000);
         assert_eq!(start, 1_700_000_020_000);
+    }
+
+    #[test]
+    fn test_sampling_interval() {
+        let mut pkt = Vec::new();
+        let export_time: u32 = 1_700_000_000;
+
+        // Header
+        pkt.extend_from_slice(&10u16.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // length placeholder
+        pkt.extend_from_slice(&export_time.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        pkt.extend_from_slice(&1u32.to_be_bytes());
+
+        // Template: IPV4_DST_ADDR, IN_BYTES, IN_PACKETS, samplingPacketInterval(305)
+        let field_count: u16 = 4;
+        let set_len = 4 + 4 + (field_count as usize) * 4;
+        let set_len_padded = (set_len + 3) & !3;
+
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&(set_len_padded as u16).to_be_bytes());
+        pkt.extend_from_slice(&256u16.to_be_bytes());
+        pkt.extend_from_slice(&field_count.to_be_bytes());
+
+        pkt.extend_from_slice(&12u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes()); // IPV4_DST_ADDR
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes()); // IN_BYTES
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes()); // IN_PACKETS
+        pkt.extend_from_slice(&305u16.to_be_bytes());
+        pkt.extend_from_slice(&4u16.to_be_bytes()); // samplingPacketInterval
+
+        while pkt.len() < HEADER_LEN + set_len_padded {
+            pkt.push(0);
+        }
+
+        // Data set: record = 4+4+4+4 = 16 bytes
+        let record_len = 16;
+        let data_set_len = 4 + record_len;
+        let data_set_padded = (data_set_len + 3) & !3;
+
+        pkt.extend_from_slice(&256u16.to_be_bytes());
+        pkt.extend_from_slice(&(data_set_padded as u16).to_be_bytes());
+
+        pkt.extend_from_slice(&Ipv4Addr::new(10, 1, 1, 1).octets());
+        pkt.extend_from_slice(&1000u32.to_be_bytes()); // in_bytes
+        pkt.extend_from_slice(&5u32.to_be_bytes()); // in_packets
+        pkt.extend_from_slice(&100u32.to_be_bytes()); // sampling interval = 1:100
+
+        while pkt.len() < HEADER_LEN + set_len_padded + data_set_padded {
+            pkt.push(0);
+        }
+
+        let total_len = pkt.len() as u16;
+        let len_bytes = total_len.to_be_bytes();
+        pkt[2] = len_bytes[0];
+        pkt[3] = len_bytes[1];
+
+        let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut parser = IpfixParser::new();
+        let mut flows = Vec::new();
+        parser.parse_into(&pkt, exporter, &mut flows).unwrap();
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].byte_count, 1000 * 100);
+        assert_eq!(flows[0].packet_count, 5 * 100);
     }
 }

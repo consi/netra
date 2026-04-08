@@ -9,6 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 const TSV_URL: &str = "https://iptoasn.com/data/ip2asn-combined.tsv.gz";
 
 pub async fn download_and_build() -> Result<AsnDb, Box<dyn std::error::Error + Send + Sync>> {
+    // Ensure ring crypto provider is installed for rustls (idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let resp = reqwest::get(TSV_URL).await?.error_for_status()?;
     let bytes = resp.bytes().await?;
 

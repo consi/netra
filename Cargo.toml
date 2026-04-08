@@ -29,7 +29,9 @@ libc = "0.2"
 aya = "0.13"
 
 # ASN database
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
 flate2 = "1"
 
 [profile.release]

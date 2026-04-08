@@ -16,10 +16,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             arch: amd64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             arch: arm64
 
@@ -42,16 +42,16 @@ jobs:
       - name: Enable pnpm
         run: corepack enable && corepack prepare pnpm@latest --activate
 
-      - name: Install cross-compilation tools
-        if: matrix.arch == 'arm64'
+      - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
+            echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+            mkdir -p .cargo
+            printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' >> .cargo/config.toml
+          fi
 
       - name: Set version from tag
         run: |
@@ -74,7 +74,6 @@ jobs:
         run: |
           mkdir -p dist/pkg
           cp target/${{ matrix.target }}/release/netra dist/pkg/
-          strip dist/pkg/netra 2>/dev/null || true
           cd dist/pkg && tar czf ../../netra-${VERSION}-linux-${{ matrix.arch }}.tar.gz netra
 
       - name: Build .deb package
@@ -85,7 +84,6 @@ jobs:
           mkdir -p dist/$PKG/lib/systemd/system
           mkdir -p dist/$PKG/var/lib/netra
           cp target/${{ matrix.target }}/release/netra dist/$PKG/usr/bin/
-          strip dist/$PKG/usr/bin/netra 2>/dev/null || true
           cp dist/netra.service dist/$PKG/lib/systemd/system/
           cat > dist/$PKG/DEBIAN/control << EOF
           Package: netra
@@ -138,7 +136,6 @@ jobs:
           %dir %attr(0755,netra,netra) /var/lib/netra
           EOF
           cp target/${{ matrix.target }}/release/netra rpmbuild/SOURCES/
-          strip rpmbuild/SOURCES/netra 2>/dev/null || true
           cp dist/netra.service rpmbuild/SOURCES/
           rpmbuild --define "_topdir $(pwd)/rpmbuild" \
                    --define "version ${VERSION}" \
@@ -156,7 +153,7 @@ jobs:
       - name: Build and push Docker image
         run: |
           docker build \
-            --build-arg TARGET=${{ matrix.target }} \
+            --platform linux/${{ matrix.arch }} \
             --build-arg BINARY=target/${{ matrix.target }}/release/netra \
             -f Dockerfile.release \
             -t ghcr.io/${{ github.repository }}:${VERSION}-${{ matrix.arch }} \

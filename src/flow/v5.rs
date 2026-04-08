@@ -21,6 +21,16 @@ pub fn parse_into(data: &[u8], flows: &mut Vec<ExtractedFlow>) -> Result<(), Par
     let unix_secs = read_u32(data, 8) as u64;
     let unix_nsecs = read_u32(data, 12) as u64;
 
+    // Sampling interval: offset 22-23, bits 0-13 = interval, bits 14-15 = mode.
+    // Per Cisco NetFlow v5 spec, mode 0 = no sampling.
+    let sampling_raw = read_u16(data, 22);
+    let sampling_interval = (sampling_raw & 0x3FFF) as u64;
+    let sampling_multiplier = if sampling_interval > 1 {
+        sampling_interval
+    } else {
+        1
+    };
+
     let expected_len = HEADER_LEN + count * RECORD_LEN;
     if data.len() < expected_len {
         return Err(ParseError::Truncated);
@@ -65,8 +75,8 @@ pub fn parse_into(data: &[u8], flows: &mut Vec<ExtractedFlow>) -> Result<(), Par
             dst_ip: IpAddr::V4(dst_ip),
             src_ip: IpAddr::V4(src_ip),
             vlan_id: 1,
-            byte_count,
-            packet_count,
+            byte_count: byte_count * sampling_multiplier,
+            packet_count: packet_count * sampling_multiplier,
             flow_start_ms: start_ms,
             flow_end_ms: end_ms,
         });
@@ -219,5 +229,36 @@ mod tests {
         let mut flows = Vec::new();
         parse_into(&pkt, &mut flows).unwrap();
         assert_eq!(flows[0].flow_start_ms, flows[0].flow_end_ms);
+    }
+
+    #[test]
+    fn test_sampling_interval() {
+        let mut pkt = build_v5_packet(
+            1,
+            10_000,
+            1_700_000_000,
+            0,
+            &[V5Record {
+                src_addr: Ipv4Addr::new(10, 0, 0, 1),
+                dst_addr: Ipv4Addr::new(192, 168, 1, 1),
+                d_pkts: 10,
+                d_octets: 1000,
+                first: 5_000,
+                last: 9_000,
+            }],
+        );
+
+        // Set sampling interval to 100 (mode=1 systematic, interval=100).
+        // Offset 22-23: bits 14-15 = mode (01), bits 0-13 = interval (100).
+        let sampling_raw: u16 = (1 << 14) | 100;
+        let sampling_bytes = sampling_raw.to_be_bytes();
+        pkt[22] = sampling_bytes[0];
+        pkt[23] = sampling_bytes[1];
+
+        let mut flows = Vec::new();
+        parse_into(&pkt, &mut flows).unwrap();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].byte_count, 1000 * 100);
+        assert_eq!(flows[0].packet_count, 10 * 100);
     }
 }
