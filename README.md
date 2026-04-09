@@ -88,6 +88,58 @@ systemctl daemon-reload
 systemctl restart netra
 ```
 
+## Prometheus Exporter
+
+Netra exposes a Prometheus-compatible metrics endpoint at `/metrics`. It uses the same windowed aggregation as the dashboard, returning gauge metrics in the Prometheus text exposition format.
+
+```
+GET /metrics?window=60&top=25
+```
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `window` | 60 | 5-300 | Lookback window in seconds |
+| `top` | 25 | 1-100 | Number of top ASNs per direction per VLAN |
+
+Malformed query parameters silently fall back to defaults.
+
+### Metrics
+
+**Totals per VLAN and direction** (labels: `vlan`, `direction`):
+
+| Metric | Description |
+|--------|-------------|
+| `netra_total_bytes` | Total bytes in the window |
+| `netra_total_packets` | Total packets in the window |
+| `netra_total_flows` | Total flows in the window |
+
+**Per-ASN breakdown** (labels: `vlan`, `direction`, `asn`, `name`, `country`):
+
+| Metric | Description |
+|--------|-------------|
+| `netra_asn_bytes` | Bytes attributed to this ASN |
+| `netra_asn_packets` | Packets attributed to this ASN |
+| `netra_asn_flows` | Flows attributed to this ASN |
+| `netra_asn_bytes_percent` | Percentage of total bytes |
+| `netra_asn_packets_percent` | Percentage of total packets |
+| `netra_asn_flows_percent` | Percentage of total flows |
+
+Each VLAN produces its own set of metrics. A `vlan="total"` series aggregates across all VLANs. The `--skip-asns` flag applies to Prometheus output the same way it does to the dashboard.
+
+### Prometheus scrape config
+
+```yaml
+scrape_configs:
+  - job_name: netra
+    scrape_interval: 30s
+    metrics_path: /metrics
+    params:
+      window: ['60']
+      top: ['25']
+    static_configs:
+      - targets: ['localhost:1337']
+```
+
 ## Architecture
 
 ```
