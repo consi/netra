@@ -1,5 +1,7 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+
+use dashmap::DashMap;
 
 use super::{ExtractedFlow, ParseError, read_u16, read_u32, read_uint};
 
@@ -56,21 +58,31 @@ struct OptionsTemplate {
     sampling_packet_space: Option<FieldLoc>,
 }
 
+/// Shared template and sampling-rate state for NetFlow v9, safe for concurrent access
+/// across multiple SO_REUSEPORT listener threads.
+pub struct V9Cache {
+    templates: DashMap<(IpAddr, u32, u16), ResolvedTemplate>,
+    options_templates: DashMap<(IpAddr, u32, u16), OptionsTemplate>,
+    sampling_rates: DashMap<(IpAddr, u32, u64), u64>,
+}
+
+impl V9Cache {
+    pub fn new() -> Self {
+        Self {
+            templates: DashMap::new(),
+            options_templates: DashMap::new(),
+            sampling_rates: DashMap::new(),
+        }
+    }
+}
+
 pub struct V9Parser {
-    templates: HashMap<(IpAddr, u32, u16), ResolvedTemplate>,
-    options_templates: HashMap<(IpAddr, u32, u16), OptionsTemplate>,
-    /// Per-(exporter, source_id, sampler_id) sampling rate learned from options data.
-    /// sampler_id=0 is the global/default rate.
-    sampling_rates: HashMap<(IpAddr, u32, u64), u64>,
+    cache: Arc<V9Cache>,
 }
 
 impl V9Parser {
-    pub fn new() -> Self {
-        Self {
-            templates: HashMap::new(),
-            options_templates: HashMap::new(),
-            sampling_rates: HashMap::new(),
-        }
+    pub fn new(cache: Arc<V9Cache>) -> Self {
+        Self { cache }
     }
 
     /// Parse a NetFlow v9 datagram, appending flows into an existing Vec.
@@ -135,7 +147,12 @@ impl V9Parser {
                 id if id >= 256 => {
                     // Data FlowSet — could be flow data or options data
                     let key = (exporter, source_id, id);
-                    if let Some(opts_tmpl) = self.options_templates.get(&key).cloned() {
+                    if let Some(opts_tmpl) = self
+                        .cache
+                        .options_templates
+                        .get(&key)
+                        .map(|r| r.value().clone())
+                    {
                         self.parse_options_data_flowset(
                             data,
                             cursor + 4,
@@ -144,7 +161,9 @@ impl V9Parser {
                             exporter,
                             source_id,
                         );
-                    } else if let Some(tmpl) = self.templates.get(&key).cloned() {
+                    } else if let Some(tmpl) =
+                        self.cache.templates.get(&key).map(|r| r.value().clone())
+                    {
                         self.parse_data_flowset(
                             data,
                             cursor + 4,
@@ -224,7 +243,7 @@ impl V9Parser {
                 offset += field_len;
             }
 
-            self.options_templates.insert(
+            self.cache.options_templates.insert(
                 (exporter, source_id, template_id),
                 OptionsTemplate {
                     record_len: offset,
@@ -271,7 +290,8 @@ impl V9Parser {
                         .as_ref()
                         .map(|loc| read_uint(rec, loc.offset, loc.length))
                         .unwrap_or(0);
-                    self.sampling_rates
+                    self.cache
+                        .sampling_rates
                         .insert((exporter, source_id, sampler_id), rate);
                 }
             }
@@ -347,7 +367,8 @@ impl V9Parser {
             }
 
             tmpl.record_len = offset;
-            self.templates
+            self.cache
+                .templates
                 .insert((exporter, source_id, template_id), tmpl);
         }
 
@@ -371,9 +392,10 @@ impl V9Parser {
         }
 
         let global_sampling = self
+            .cache
             .sampling_rates
             .get(&(exporter, source_id, 0))
-            .copied()
+            .map(|r| *r.value())
             .unwrap_or(1)
             .max(1);
 
@@ -475,9 +497,10 @@ impl V9Parser {
                 if v > 1 { v } else { global_sampling }
             } else if let Some(loc) = &tmpl.sampler_id {
                 let sid = read_uint(rec, loc.offset, loc.length);
-                self.sampling_rates
+                self.cache
+                    .sampling_rates
                     .get(&(exporter, source_id, sid))
-                    .copied()
+                    .map(|r| *r.value())
                     .unwrap_or(global_sampling)
                     .max(1)
             } else {
@@ -593,7 +616,7 @@ mod tests {
         let pkt = build_v9_packet();
         let exporter = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
 
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
         let mut flows = Vec::new();
         parser.parse_into(&pkt, exporter, &mut flows).unwrap();
 
@@ -617,7 +640,7 @@ mod tests {
     fn test_data_before_template() {
         // Send data flowset referencing unknown template → should return empty.
         let exporter = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
 
         let mut pkt = Vec::new();
         // Header
@@ -640,7 +663,7 @@ mod tests {
 
     #[test]
     fn test_too_short() {
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
         let exporter = IpAddr::V4(Ipv4Addr::LOCALHOST);
         assert!(
             parser
@@ -651,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_bad_version() {
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
         let exporter = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut pkt = vec![0u8; HEADER_LEN];
         pkt[1] = 5; // version 5 instead of 9
@@ -686,7 +709,7 @@ mod tests {
     #[test]
     fn test_template_and_data_in_separate_packets() {
         let exporter = IpAddr::V4(Ipv4Addr::new(172, 16, 40, 1));
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
         let source_id: u32 = 768;
         let sys_uptime: u32 = 60_000;
         let unix_secs: u32 = 1_700_000_000;
@@ -760,7 +783,7 @@ mod tests {
     #[test]
     fn test_different_source_ids_isolated() {
         let exporter = IpAddr::V4(Ipv4Addr::new(172, 16, 40, 1));
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
         let sys_uptime: u32 = 60_000;
         let unix_secs: u32 = 1_700_000_000;
 
@@ -812,7 +835,7 @@ mod tests {
     #[test]
     fn test_sampling_interval() {
         let exporter = IpAddr::V4(Ipv4Addr::new(172, 16, 40, 1));
-        let mut parser = V9Parser::new();
+        let mut parser = V9Parser::new(Arc::new(V9Cache::new()));
         let source_id: u32 = 1;
         let sys_uptime: u32 = 60_000;
         let unix_secs: u32 = 1_700_000_000;
@@ -863,5 +886,222 @@ mod tests {
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].byte_count, 500 * 200);
         assert_eq!(flows[0].packet_count, 10 * 200);
+    }
+
+    /// Simulate multiple routers with different sampling rates sharing a single
+    /// cache (as happens with SO_REUSEPORT). Parser A learns the template from
+    /// router 1, parser B learns the template from router 2 with a different
+    /// sampling rate, and then each parser can decode data from both routers.
+    #[test]
+    fn test_shared_cache_multiple_routers() {
+        let cache = Arc::new(V9Cache::new());
+        let mut parser_a = V9Parser::new(cache.clone());
+        let mut parser_b = V9Parser::new(cache.clone());
+
+        let router1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let router2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let sys_uptime: u32 = 60_000;
+        let unix_secs: u32 = 1_700_000_000;
+        let source_id: u32 = 1;
+
+        // --- Router 1: template + inline sampling field, arrives on parser A ---
+        let mut pkt1 = Vec::new();
+        build_v9_header(&mut pkt1, 0, sys_uptime, unix_secs, 1, source_id);
+        // Template: SRC(4), DST(4), BYTES(4), PACKETS(4), SAMPLING_INTERVAL(4)
+        let field_count: u16 = 5;
+        let tmpl_fs_len = (4 + 4 + (field_count as usize) * 4 + 3) & !3;
+        pkt1.extend_from_slice(&0u16.to_be_bytes());
+        pkt1.extend_from_slice(&(tmpl_fs_len as u16).to_be_bytes());
+        pkt1.extend_from_slice(&256u16.to_be_bytes());
+        pkt1.extend_from_slice(&field_count.to_be_bytes());
+        for &(ft, fl) in &[(8, 4), (12, 4), (1, 4), (2, 4), (34, 4)] {
+            pkt1.extend_from_slice(&(ft as u16).to_be_bytes());
+            pkt1.extend_from_slice(&(fl as u16).to_be_bytes());
+        }
+        while pkt1.len() < 20 + tmpl_fs_len {
+            pkt1.push(0);
+        }
+        parser_a
+            .parse_into(&pkt1, router1, &mut Vec::new())
+            .unwrap();
+
+        // --- Router 2: same template layout, arrives on parser B ---
+        let mut pkt2 = Vec::new();
+        build_v9_header(&mut pkt2, 0, sys_uptime, unix_secs, 1, source_id);
+        pkt2.extend_from_slice(&0u16.to_be_bytes());
+        pkt2.extend_from_slice(&(tmpl_fs_len as u16).to_be_bytes());
+        pkt2.extend_from_slice(&256u16.to_be_bytes());
+        pkt2.extend_from_slice(&field_count.to_be_bytes());
+        for &(ft, fl) in &[(8, 4), (12, 4), (1, 4), (2, 4), (34, 4)] {
+            pkt2.extend_from_slice(&(ft as u16).to_be_bytes());
+            pkt2.extend_from_slice(&(fl as u16).to_be_bytes());
+        }
+        while pkt2.len() < 20 + tmpl_fs_len {
+            pkt2.push(0);
+        }
+        parser_b
+            .parse_into(&pkt2, router2, &mut Vec::new())
+            .unwrap();
+
+        // --- Router 1 data arrives on parser B (cross-thread!) with sampling=100 ---
+        let mut data1 = Vec::new();
+        build_v9_header(&mut data1, 1, sys_uptime, unix_secs, 2, source_id);
+        let record_len = 20; // 4+4+4+4+4
+        let data_fs_len = (4 + record_len + 3) & !3;
+        data1.extend_from_slice(&256u16.to_be_bytes());
+        data1.extend_from_slice(&(data_fs_len as u16).to_be_bytes());
+        data1.extend_from_slice(&Ipv4Addr::new(192, 168, 1, 1).octets());
+        data1.extend_from_slice(&Ipv4Addr::new(10, 1, 1, 1).octets());
+        data1.extend_from_slice(&1000u32.to_be_bytes()); // bytes
+        data1.extend_from_slice(&5u32.to_be_bytes()); // packets
+        data1.extend_from_slice(&100u32.to_be_bytes()); // sampling = 1:100
+        while data1.len() < 20 + data_fs_len {
+            data1.push(0);
+        }
+
+        let mut flows = Vec::new();
+        parser_b.parse_into(&data1, router1, &mut flows).unwrap();
+        assert_eq!(
+            flows.len(),
+            1,
+            "parser B must decode router 1 data via shared cache"
+        );
+        assert_eq!(flows[0].byte_count, 1000 * 100);
+        assert_eq!(flows[0].packet_count, 5 * 100);
+
+        // --- Router 2 data arrives on parser A (cross-thread!) with sampling=500 ---
+        let mut data2 = Vec::new();
+        build_v9_header(&mut data2, 1, sys_uptime, unix_secs, 2, source_id);
+        data2.extend_from_slice(&256u16.to_be_bytes());
+        data2.extend_from_slice(&(data_fs_len as u16).to_be_bytes());
+        data2.extend_from_slice(&Ipv4Addr::new(172, 16, 0, 1).octets());
+        data2.extend_from_slice(&Ipv4Addr::new(10, 2, 2, 2).octets());
+        data2.extend_from_slice(&2000u32.to_be_bytes()); // bytes
+        data2.extend_from_slice(&8u32.to_be_bytes()); // packets
+        data2.extend_from_slice(&500u32.to_be_bytes()); // sampling = 1:500
+        while data2.len() < 20 + data_fs_len {
+            data2.push(0);
+        }
+
+        flows.clear();
+        parser_a.parse_into(&data2, router2, &mut flows).unwrap();
+        assert_eq!(
+            flows.len(),
+            1,
+            "parser A must decode router 2 data via shared cache"
+        );
+        assert_eq!(flows[0].byte_count, 2000 * 500);
+        assert_eq!(flows[0].packet_count, 8 * 500);
+
+        // Verify isolation: router 1 and router 2 templates are separate in cache
+        assert!(cache.templates.contains_key(&(router1, source_id, 256)));
+        assert!(cache.templates.contains_key(&(router2, source_id, 256)));
+    }
+
+    /// Verify that options-based sampling rates learned on one parser are visible
+    /// to another parser sharing the same cache.
+    #[test]
+    fn test_shared_cache_options_sampling_cross_thread() {
+        let cache = Arc::new(V9Cache::new());
+        let mut parser_a = V9Parser::new(cache.clone());
+        let mut parser_b = V9Parser::new(cache.clone());
+
+        let router = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let sys_uptime: u32 = 60_000;
+        let unix_secs: u32 = 1_700_000_000;
+        let source_id: u32 = 1;
+
+        // --- Parser A: receives options template (flowset_id=1) ---
+        let mut opts_tmpl = Vec::new();
+        build_v9_header(&mut opts_tmpl, 0, sys_uptime, unix_secs, 1, source_id);
+        // Options template: id=300, scope_length=4 (1 scope field), option_length=4 (1 option field)
+        let opts_fs_len = (4 + 6 + 4 + 4 + 3) & !3; // header + tmpl_header + scope + option, padded
+        opts_tmpl.extend_from_slice(&1u16.to_be_bytes()); // flowset_id=1 (options template)
+        opts_tmpl.extend_from_slice(&(opts_fs_len as u16).to_be_bytes());
+        opts_tmpl.extend_from_slice(&300u16.to_be_bytes()); // template_id
+        opts_tmpl.extend_from_slice(&4u16.to_be_bytes()); // scope_length (1 field * 4 bytes)
+        opts_tmpl.extend_from_slice(&4u16.to_be_bytes()); // option_length (1 field * 4 bytes)
+        // Scope field: type=1 (system), length=4
+        opts_tmpl.extend_from_slice(&1u16.to_be_bytes());
+        opts_tmpl.extend_from_slice(&4u16.to_be_bytes());
+        // Option field: SAMPLING_INTERVAL (34), length=4
+        opts_tmpl.extend_from_slice(&34u16.to_be_bytes());
+        opts_tmpl.extend_from_slice(&4u16.to_be_bytes());
+        while opts_tmpl.len() < 20 + opts_fs_len {
+            opts_tmpl.push(0);
+        }
+        parser_a
+            .parse_into(&opts_tmpl, router, &mut Vec::new())
+            .unwrap();
+
+        // --- Parser A: receives options data (flowset_id=300) with rate=256 ---
+        let mut opts_data = Vec::new();
+        build_v9_header(&mut opts_data, 0, sys_uptime, unix_secs, 2, source_id);
+        let rec_len = 8; // scope(4) + sampling(4)
+        let data_fs_len = (4 + rec_len + 3) & !3;
+        opts_data.extend_from_slice(&300u16.to_be_bytes());
+        opts_data.extend_from_slice(&(data_fs_len as u16).to_be_bytes());
+        opts_data.extend_from_slice(&0u32.to_be_bytes()); // scope value (don't care)
+        opts_data.extend_from_slice(&256u32.to_be_bytes()); // sampling_interval=256
+        while opts_data.len() < 20 + data_fs_len {
+            opts_data.push(0);
+        }
+        parser_a
+            .parse_into(&opts_data, router, &mut Vec::new())
+            .unwrap();
+
+        // Verify sampling rate is in shared cache
+        assert_eq!(
+            cache
+                .sampling_rates
+                .get(&(router, source_id, 0))
+                .map(|r| *r.value()),
+            Some(256),
+        );
+
+        // --- Parser B: receives data template from same router ---
+        let mut tmpl_pkt = Vec::new();
+        build_v9_header(&mut tmpl_pkt, 0, sys_uptime, unix_secs, 3, source_id);
+        let field_count: u16 = 4; // SRC, DST, BYTES, PACKETS (no inline sampling)
+        let tmpl_fs_len = (4 + 4 + (field_count as usize) * 4 + 3) & !3;
+        tmpl_pkt.extend_from_slice(&0u16.to_be_bytes());
+        tmpl_pkt.extend_from_slice(&(tmpl_fs_len as u16).to_be_bytes());
+        tmpl_pkt.extend_from_slice(&256u16.to_be_bytes());
+        tmpl_pkt.extend_from_slice(&field_count.to_be_bytes());
+        for &(ft, fl) in &[(8, 4), (12, 4), (1, 4), (2, 4)] {
+            tmpl_pkt.extend_from_slice(&(ft as u16).to_be_bytes());
+            tmpl_pkt.extend_from_slice(&(fl as u16).to_be_bytes());
+        }
+        while tmpl_pkt.len() < 20 + tmpl_fs_len {
+            tmpl_pkt.push(0);
+        }
+        parser_b
+            .parse_into(&tmpl_pkt, router, &mut Vec::new())
+            .unwrap();
+
+        // --- Parser B: receives data from same router — should use options sampling rate from parser A ---
+        let mut data_pkt = Vec::new();
+        build_v9_header(&mut data_pkt, 1, sys_uptime, unix_secs, 4, source_id);
+        let record_len = 16; // 4+4+4+4
+        let data_fs_len = (4 + record_len + 3) & !3;
+        data_pkt.extend_from_slice(&256u16.to_be_bytes());
+        data_pkt.extend_from_slice(&(data_fs_len as u16).to_be_bytes());
+        data_pkt.extend_from_slice(&Ipv4Addr::new(192, 168, 1, 1).octets());
+        data_pkt.extend_from_slice(&Ipv4Addr::new(10, 0, 0, 2).octets());
+        data_pkt.extend_from_slice(&500u32.to_be_bytes()); // bytes
+        data_pkt.extend_from_slice(&10u32.to_be_bytes()); // packets
+        while data_pkt.len() < 20 + data_fs_len {
+            data_pkt.push(0);
+        }
+
+        let mut flows = Vec::new();
+        parser_b.parse_into(&data_pkt, router, &mut flows).unwrap();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(
+            flows[0].byte_count,
+            500 * 256,
+            "parser B must use sampling rate 256 learned by parser A"
+        );
+        assert_eq!(flows[0].packet_count, 10 * 256);
     }
 }

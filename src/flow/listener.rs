@@ -5,6 +5,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use socket2::{Domain, Protocol, Socket, Type};
 
+use super::ipfix::IpfixCache;
+use super::v9::V9Cache;
 use super::{ExtractedFlow, ipfix, v5, v9};
 use crate::asn::AsnDb;
 use crate::pipeline::WindowManager;
@@ -53,6 +55,8 @@ pub fn detect_mode() -> ReceiveMode {
 }
 
 /// Spawn N OS threads, each with its own SO_REUSEPORT UDP socket on the given port.
+/// Template caches and sampling rates are shared across all threads so that a template
+/// learned on one thread is visible to data packets arriving on any other thread.
 pub fn spawn_listeners(
     count: usize,
     mode: ReceiveMode,
@@ -60,15 +64,24 @@ pub fn spawn_listeners(
     asn_db: Arc<ArcSwap<AsnDb>>,
     windows: Arc<WindowManager>,
 ) -> Vec<std::thread::JoinHandle<()>> {
+    let v9_cache = Arc::new(V9Cache::new());
+    let ipfix_cache = Arc::new(IpfixCache::new());
+
     (0..count)
         .map(|i| {
             let asn_db = asn_db.clone();
             let windows = windows.clone();
+            let v9_cache = v9_cache.clone();
+            let ipfix_cache = ipfix_cache.clone();
             std::thread::Builder::new()
                 .name(format!("udp-listener-{i}"))
                 .spawn(move || match mode {
-                    ReceiveMode::RecvMmsg => listener_loop_recvmmsg(port, asn_db, windows),
-                    ReceiveMode::RecvFrom => listener_loop_single(port, asn_db, windows),
+                    ReceiveMode::RecvMmsg => {
+                        listener_loop_recvmmsg(port, asn_db, windows, v9_cache, ipfix_cache)
+                    }
+                    ReceiveMode::RecvFrom => {
+                        listener_loop_single(port, asn_db, windows, v9_cache, ipfix_cache)
+                    }
                 })
                 .expect("failed to spawn UDP listener thread")
         })
@@ -131,12 +144,18 @@ pub(crate) fn process_packet(
 
 // --- recvmmsg batch receive (primary path) ---
 
-fn listener_loop_recvmmsg(port: u16, asn_db: Arc<ArcSwap<AsnDb>>, windows: Arc<WindowManager>) {
+fn listener_loop_recvmmsg(
+    port: u16,
+    asn_db: Arc<ArcSwap<AsnDb>>,
+    windows: Arc<WindowManager>,
+    v9_cache: Arc<V9Cache>,
+    ipfix_cache: Arc<IpfixCache>,
+) {
     let sock = create_socket(port).expect("failed to create UDP socket");
     let fd = sock.as_raw_fd();
 
-    let mut v9_parser = v9::V9Parser::new();
-    let mut ipfix_parser = ipfix::IpfixParser::new();
+    let mut v9_parser = v9::V9Parser::new(v9_cache);
+    let mut ipfix_parser = ipfix::IpfixParser::new(ipfix_cache);
     let mut flows: Vec<ExtractedFlow> = Vec::with_capacity(64);
 
     // Pre-allocate receive buffers and headers
@@ -213,11 +232,17 @@ fn sockaddr_to_ip(addr: &libc::sockaddr_in) -> IpAddr {
 
 // --- Single recv_from fallback ---
 
-fn listener_loop_single(port: u16, asn_db: Arc<ArcSwap<AsnDb>>, windows: Arc<WindowManager>) {
+fn listener_loop_single(
+    port: u16,
+    asn_db: Arc<ArcSwap<AsnDb>>,
+    windows: Arc<WindowManager>,
+    v9_cache: Arc<V9Cache>,
+    ipfix_cache: Arc<IpfixCache>,
+) {
     let sock = create_socket(port).expect("failed to create UDP socket");
 
-    let mut v9_parser = v9::V9Parser::new();
-    let mut ipfix_parser = ipfix::IpfixParser::new();
+    let mut v9_parser = v9::V9Parser::new(v9_cache);
+    let mut ipfix_parser = ipfix::IpfixParser::new(ipfix_cache);
     let mut buf = [0u8; 65535];
     let mut flows: Vec<ExtractedFlow> = Vec::with_capacity(64);
 

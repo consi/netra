@@ -452,6 +452,8 @@ mod imp {
             format!("XskMap: {e}").into()
         })?;
 
+        let v9_cache = Arc::new(crate::flow::v9::V9Cache::new());
+        let ipfix_cache = Arc::new(crate::flow::ipfix::IpfixCache::new());
         let mut handles = Vec::with_capacity(queue_count as usize);
 
         for queue_id in 0..queue_count {
@@ -472,9 +474,11 @@ mod imp {
 
             let asn_db = asn_db.clone();
             let windows = windows.clone();
+            let v9_cache = v9_cache.clone();
+            let ipfix_cache = ipfix_cache.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("xdp-listener-{queue_id}"))
-                .spawn(move || xdp_listener_loop(xsk, asn_db, windows))
+                .spawn(move || xdp_listener_loop(xsk, asn_db, windows, v9_cache, ipfix_cache))
                 .expect("failed to spawn XDP listener thread");
             handles.push(handle);
         }
@@ -499,9 +503,15 @@ mod imp {
             })
     }
 
-    fn xdp_listener_loop(xsk: XskSocket, asn_db: Arc<ArcSwap<AsnDb>>, windows: Arc<WindowManager>) {
-        let mut v9_parser = v9::V9Parser::new();
-        let mut ipfix_parser = ipfix::IpfixParser::new();
+    fn xdp_listener_loop(
+        xsk: XskSocket,
+        asn_db: Arc<ArcSwap<AsnDb>>,
+        windows: Arc<WindowManager>,
+        v9_cache: Arc<crate::flow::v9::V9Cache>,
+        ipfix_cache: Arc<crate::flow::ipfix::IpfixCache>,
+    ) {
+        let mut v9_parser = v9::V9Parser::new(v9_cache);
+        let mut ipfix_parser = ipfix::IpfixParser::new(ipfix_cache);
         let mut flows: Vec<ExtractedFlow> = Vec::with_capacity(64);
         let mut batch: Vec<(u64, u32)> = Vec::with_capacity(64);
 

@@ -1,6 +1,8 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 // SystemTime removed: we use u64 epoch millis directly
+
+use dashmap::DashMap;
 
 use super::{ExtractedFlow, ParseError, read_u16, read_u32, read_uint};
 
@@ -102,21 +104,31 @@ struct OptionsTemplate {
     sampling_packet_space: Option<FieldLoc>,
 }
 
+/// Shared template and sampling-rate state for IPFIX, safe for concurrent access
+/// across multiple SO_REUSEPORT listener threads.
+pub struct IpfixCache {
+    templates: DashMap<(IpAddr, u32, u16), (ResolvedIpfixTemplate, FieldIndices)>,
+    options_templates: DashMap<(IpAddr, u32, u16), OptionsTemplate>,
+    sampling_rates: DashMap<(IpAddr, u32, u64), u64>,
+}
+
+impl IpfixCache {
+    pub fn new() -> Self {
+        Self {
+            templates: DashMap::new(),
+            options_templates: DashMap::new(),
+            sampling_rates: DashMap::new(),
+        }
+    }
+}
+
 pub struct IpfixParser {
-    templates: HashMap<(IpAddr, u32, u16), (ResolvedIpfixTemplate, FieldIndices)>,
-    options_templates: HashMap<(IpAddr, u32, u16), OptionsTemplate>,
-    /// Per-(exporter, observation_domain, sampler_id) sampling rate learned from options data.
-    /// sampler_id=0 is the global/default rate (no sampler ID in options).
-    sampling_rates: HashMap<(IpAddr, u32, u64), u64>,
+    cache: Arc<IpfixCache>,
 }
 
 impl IpfixParser {
-    pub fn new() -> Self {
-        Self {
-            templates: HashMap::new(),
-            options_templates: HashMap::new(),
-            sampling_rates: HashMap::new(),
-        }
+    pub fn new(cache: Arc<IpfixCache>) -> Self {
+        Self { cache }
     }
 
     /// Parse an IPFIX datagram, appending flows into an existing Vec.
@@ -180,7 +192,12 @@ impl IpfixParser {
                 id if id >= 256 => {
                     // Data Set — could be flow data or options data
                     let key = (exporter, observation_domain_id, id);
-                    if let Some(opts_tmpl) = self.options_templates.get(&key).cloned() {
+                    if let Some(opts_tmpl) = self
+                        .cache
+                        .options_templates
+                        .get(&key)
+                        .map(|r| r.value().clone())
+                    {
                         // Options data record — extract sampling rate
                         self.parse_options_data_set(
                             data,
@@ -190,7 +207,9 @@ impl IpfixParser {
                             exporter,
                             observation_domain_id,
                         );
-                    } else if let Some((tmpl, indices)) = self.templates.get(&key).cloned() {
+                    } else if let Some((tmpl, indices)) =
+                        self.cache.templates.get(&key).map(|r| r.value().clone())
+                    {
                         self.parse_data_set(
                             data,
                             cursor + 4,
@@ -278,7 +297,7 @@ impl IpfixParser {
                 }
             }
 
-            self.options_templates.insert(
+            self.cache.options_templates.insert(
                 (exporter, observation_domain_id, template_id),
                 OptionsTemplate {
                     record_len: offset,
@@ -327,7 +346,8 @@ impl IpfixParser {
                         .as_ref()
                         .map(|loc| read_uint(rec, loc.offset, loc.length))
                         .unwrap_or(0);
-                    self.sampling_rates
+                    self.cache
+                        .sampling_rates
                         .insert((exporter, observation_domain_id, sampler_id), rate);
                 }
             }
@@ -484,7 +504,7 @@ impl IpfixParser {
             }
 
             tmpl.record_len = offset; // Only meaningful if no variable-length fields.
-            self.templates.insert(
+            self.cache.templates.insert(
                 (exporter, observation_domain_id, template_id),
                 (tmpl, indices),
             );
@@ -660,18 +680,21 @@ impl IpfixParser {
         // 2. Look up by sampler_id from data record against options-learned rates.
         if let Some(loc) = &tmpl.sampler_id {
             let sid = read_uint(rec, loc.offset, loc.length);
-            if let Some(&rate) = self
+            if let Some(rate) = self
+                .cache
                 .sampling_rates
                 .get(&(exporter, observation_domain_id, sid))
+                .map(|r| *r.value())
             {
                 return rate.max(1);
             }
         }
 
         // 3. Global options rate (sampler_id=0).
-        self.sampling_rates
+        self.cache
+            .sampling_rates
             .get(&(exporter, observation_domain_id, 0))
-            .copied()
+            .map(|r| *r.value())
             .unwrap_or(1)
             .max(1)
     }
@@ -698,18 +721,21 @@ impl IpfixParser {
         if let Some(idx) = indices.sampler_id {
             let (off, len) = field_offsets[idx];
             let sid = read_uint(data, off, len);
-            if let Some(&rate) = self
+            if let Some(rate) = self
+                .cache
                 .sampling_rates
                 .get(&(exporter, observation_domain_id, sid))
+                .map(|r| *r.value())
             {
                 return rate.max(1);
             }
         }
 
         // 3. Global options rate.
-        self.sampling_rates
+        self.cache
+            .sampling_rates
             .get(&(exporter, observation_domain_id, 0))
-            .copied()
+            .map(|r| *r.value())
             .unwrap_or(1)
             .max(1)
     }
@@ -1027,7 +1053,7 @@ mod tests {
         let pkt = build_ipfix_packet();
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
         parser.parse_into(&pkt, exporter, &mut flows).unwrap();
 
@@ -1091,18 +1117,18 @@ mod tests {
         pkt[3] = len_bytes[1];
 
         let exporter = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
         parser.parse_into(&pkt, exporter, &mut flows).unwrap();
         assert!(flows.is_empty()); // no data set, just template
 
         // Verify template was stored: key (localhost, 1, 300)
-        assert!(parser.templates.contains_key(&(exporter, 1, 300)));
+        assert!(parser.cache.templates.contains_key(&(exporter, 1, 300)));
     }
 
     #[test]
     fn test_too_short() {
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let exporter = IpAddr::V4(Ipv4Addr::LOCALHOST);
         assert!(
             parser
@@ -1113,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_bad_version() {
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let exporter = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut pkt = vec![0u8; HEADER_LEN];
         // Set length to HEADER_LEN
@@ -1187,7 +1213,7 @@ mod tests {
         pkt[3] = len_bytes[1];
 
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
         parser.parse_into(&pkt, exporter, &mut flows).unwrap();
 
@@ -1265,7 +1291,7 @@ mod tests {
         pkt[3] = len_bytes[1];
 
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
         parser.parse_into(&pkt, exporter, &mut flows).unwrap();
 
@@ -1363,7 +1389,7 @@ mod tests {
         pkt[3] = total_len.to_be_bytes()[1];
 
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
         parser.parse_into(&pkt, exporter, &mut flows).unwrap();
 
@@ -1378,7 +1404,7 @@ mod tests {
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let observation_domain_id: u32 = 42;
         let export_time: u32 = 1_700_000_000;
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
 
         // Packet 1: data template + options template + options data
         let mut pkt1 = Vec::new();
@@ -1475,7 +1501,7 @@ mod tests {
     #[test]
     fn test_real_ipfix_data_options_sampling_1024() {
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 48, 204));
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
 
         // Packet 1: Data template (set_id=2, template 256 with 29 fields, no sampling field).
         let tmpl_pkt: &[u8] = &[
@@ -1526,8 +1552,12 @@ mod tests {
             .unwrap();
         assert!(flows.is_empty());
         assert_eq!(
-            parser.sampling_rates.get(&(exporter, 0x00080000, 0)),
-            Some(&1024u64),
+            parser
+                .cache
+                .sampling_rates
+                .get(&(exporter, 0x00080000, 0))
+                .map(|r| *r.value()),
+            Some(1024u64),
             "sampling rate 1024 must be learned from options data"
         );
 
@@ -1622,7 +1652,7 @@ mod tests {
     #[test]
     fn test_sampler_id_based_sampling() {
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
 
         // Packet 1: Options Template (set_id=3, template 512).
@@ -1656,7 +1686,14 @@ mod tests {
         parser
             .parse_into(opts_data_pkt, exporter, &mut flows)
             .unwrap();
-        assert_eq!(parser.sampling_rates.get(&(exporter, 1, 5)), Some(&2000u64));
+        assert_eq!(
+            parser
+                .cache
+                .sampling_rates
+                .get(&(exporter, 1, 5))
+                .map(|r| *r.value()),
+            Some(2000u64)
+        );
 
         // Packet 3: Data Template (set_id=2, template 256).
         // 7 fields * 4 = 28.  Set: 4 + 4 + 28 = 36.  Packet: 16+36 = 52.
@@ -1703,7 +1740,7 @@ mod tests {
     #[test]
     fn test_sampling_packet_space() {
         let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let mut parser = IpfixParser::new();
+        let mut parser = IpfixParser::new(Arc::new(IpfixCache::new()));
         let mut flows = Vec::new();
 
         // Options Template (set_id=3, template 512).
@@ -1734,8 +1771,12 @@ mod tests {
             .parse_into(opts_data_pkt, exporter, &mut flows)
             .unwrap();
         assert_eq!(
-            parser.sampling_rates.get(&(exporter, 1, 0)),
-            Some(&1000u64),
+            parser
+                .cache
+                .sampling_rates
+                .get(&(exporter, 1, 0))
+                .map(|r| *r.value()),
+            Some(1000u64),
             "rate should be (1+999)/1 = 1000"
         );
 
@@ -1775,5 +1816,122 @@ mod tests {
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].byte_count, 100_000);
         assert_eq!(flows[0].packet_count, 2_000);
+    }
+
+    /// Two IPFIX exporters with different sampling rates share the same cache.
+    /// Templates and options learned on one parser are used by another, simulating
+    /// SO_REUSEPORT packet distribution across threads.
+    #[test]
+    fn test_shared_cache_multiple_exporters() {
+        let cache = Arc::new(IpfixCache::new());
+        let mut parser_a = IpfixParser::new(cache.clone());
+        let mut parser_b = IpfixParser::new(cache.clone());
+
+        let router1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let router2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let obs_domain: u32 = 1;
+
+        // Helper: build an IPFIX header
+        fn ipfix_hdr(pkt: &mut Vec<u8>, length: u16, export_time: u32, obs_domain: u32) {
+            pkt.extend_from_slice(&10u16.to_be_bytes());
+            pkt.extend_from_slice(&length.to_be_bytes());
+            pkt.extend_from_slice(&export_time.to_be_bytes());
+            pkt.extend_from_slice(&0u32.to_be_bytes());
+            pkt.extend_from_slice(&obs_domain.to_be_bytes());
+        }
+
+        // --- Router 1 template arrives on parser A ---
+        // Template 256: SRC_IPV4(4), DST_IPV4(4), IN_BYTES(4), IN_PACKETS(4), SAMPLING_INTERVAL(4)
+        let field_count: u16 = 5;
+        let tmpl_set_len = 4 + 4 + (field_count as usize) * 4; // set header + tmpl header + fields
+        let tmpl_set_padded = (tmpl_set_len + 3) & !3;
+        let pkt_len = 16 + tmpl_set_padded;
+
+        let mut pkt1 = Vec::new();
+        ipfix_hdr(&mut pkt1, pkt_len as u16, 1_700_000_000, obs_domain);
+        pkt1.extend_from_slice(&2u16.to_be_bytes()); // set_id=2 (template)
+        pkt1.extend_from_slice(&(tmpl_set_padded as u16).to_be_bytes());
+        pkt1.extend_from_slice(&256u16.to_be_bytes());
+        pkt1.extend_from_slice(&field_count.to_be_bytes());
+        for &(ft, fl) in &[(8, 4), (12, 4), (1, 4), (2, 4), (34, 4)] {
+            pkt1.extend_from_slice(&(ft as u16).to_be_bytes());
+            pkt1.extend_from_slice(&(fl as u16).to_be_bytes());
+        }
+        while pkt1.len() < pkt_len {
+            pkt1.push(0);
+        }
+        parser_a
+            .parse_into(&pkt1, router1, &mut Vec::new())
+            .unwrap();
+
+        // --- Router 2 template arrives on parser B (same layout) ---
+        let mut pkt2 = Vec::new();
+        ipfix_hdr(&mut pkt2, pkt_len as u16, 1_700_000_000, obs_domain);
+        pkt2.extend_from_slice(&2u16.to_be_bytes());
+        pkt2.extend_from_slice(&(tmpl_set_padded as u16).to_be_bytes());
+        pkt2.extend_from_slice(&256u16.to_be_bytes());
+        pkt2.extend_from_slice(&field_count.to_be_bytes());
+        for &(ft, fl) in &[(8, 4), (12, 4), (1, 4), (2, 4), (34, 4)] {
+            pkt2.extend_from_slice(&(ft as u16).to_be_bytes());
+            pkt2.extend_from_slice(&(fl as u16).to_be_bytes());
+        }
+        while pkt2.len() < pkt_len {
+            pkt2.push(0);
+        }
+        parser_b
+            .parse_into(&pkt2, router2, &mut Vec::new())
+            .unwrap();
+
+        // --- Router 1 data on parser B (cross-thread), sampling=100 ---
+        let record_len = 20; // 4+4+4+4+4
+        let data_set_len = (4 + record_len + 3) & !3;
+        let data_pkt_len = 16 + data_set_len;
+
+        let mut d1 = Vec::new();
+        ipfix_hdr(&mut d1, data_pkt_len as u16, 1_700_000_000, obs_domain);
+        d1.extend_from_slice(&256u16.to_be_bytes());
+        d1.extend_from_slice(&(data_set_len as u16).to_be_bytes());
+        d1.extend_from_slice(&Ipv4Addr::new(192, 168, 1, 1).octets());
+        d1.extend_from_slice(&Ipv4Addr::new(10, 1, 1, 1).octets());
+        d1.extend_from_slice(&1000u32.to_be_bytes());
+        d1.extend_from_slice(&5u32.to_be_bytes());
+        d1.extend_from_slice(&100u32.to_be_bytes()); // sampling=100
+        while d1.len() < data_pkt_len {
+            d1.push(0);
+        }
+
+        let mut flows = Vec::new();
+        parser_b.parse_into(&d1, router1, &mut flows).unwrap();
+        assert_eq!(
+            flows.len(),
+            1,
+            "parser B must decode router 1 data via shared cache"
+        );
+        assert_eq!(flows[0].byte_count, 1000 * 100);
+        assert_eq!(flows[0].packet_count, 5 * 100);
+
+        // --- Router 2 data on parser A (cross-thread), sampling=500 ---
+        let mut d2 = Vec::new();
+        ipfix_hdr(&mut d2, data_pkt_len as u16, 1_700_000_000, obs_domain);
+        d2.extend_from_slice(&256u16.to_be_bytes());
+        d2.extend_from_slice(&(data_set_len as u16).to_be_bytes());
+        d2.extend_from_slice(&Ipv4Addr::new(172, 16, 0, 1).octets());
+        d2.extend_from_slice(&Ipv4Addr::new(10, 2, 2, 2).octets());
+        d2.extend_from_slice(&2000u32.to_be_bytes());
+        d2.extend_from_slice(&8u32.to_be_bytes());
+        d2.extend_from_slice(&500u32.to_be_bytes()); // sampling=500
+        while d2.len() < data_pkt_len {
+            d2.push(0);
+        }
+
+        flows.clear();
+        parser_a.parse_into(&d2, router2, &mut flows).unwrap();
+        assert_eq!(
+            flows.len(),
+            1,
+            "parser A must decode router 2 data via shared cache"
+        );
+        assert_eq!(flows[0].byte_count, 2000 * 500);
+        assert_eq!(flows[0].packet_count, 8 * 500);
     }
 }
