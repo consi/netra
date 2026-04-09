@@ -15,9 +15,13 @@ const IPV6_DST_ADDR: u16 = 28;
 const LAST_SWITCHED: u16 = 21;
 const FIRST_SWITCHED: u16 = 22;
 const SAMPLING_INTERVAL: u16 = 34;
+const SAMPLER_ID: u16 = 48;
+const SAMPLER_RANDOM_INTERVAL: u16 = 50;
 const SRC_VLAN: u16 = 58;
 const DST_VLAN: u16 = 59;
+const SELECTOR_ID: u16 = 302;
 const SAMPLING_PACKET_INTERVAL: u16 = 305;
+const SAMPLING_PACKET_SPACE: u16 = 306;
 
 #[derive(Clone, Debug)]
 struct FieldLoc {
@@ -39,6 +43,8 @@ struct ResolvedTemplate {
     src_vlan: Option<FieldLoc>,
     dst_vlan: Option<FieldLoc>,
     sampling_interval: Option<FieldLoc>,
+    /// samplerId (48) or selectorId (302) — used to look up per-sampler rate.
+    sampler_id: Option<FieldLoc>,
 }
 
 /// Describes the layout of an options template for extracting sampling interval.
@@ -46,13 +52,16 @@ struct ResolvedTemplate {
 struct OptionsTemplate {
     record_len: usize,
     sampling_interval: Option<FieldLoc>,
+    sampler_id: Option<FieldLoc>,
+    sampling_packet_space: Option<FieldLoc>,
 }
 
 pub struct V9Parser {
     templates: HashMap<(IpAddr, u32, u16), ResolvedTemplate>,
     options_templates: HashMap<(IpAddr, u32, u16), OptionsTemplate>,
-    /// Per-(exporter, source_id) sampling rate learned from options data.
-    sampling_rates: HashMap<(IpAddr, u32), u64>,
+    /// Per-(exporter, source_id, sampler_id) sampling rate learned from options data.
+    /// sampler_id=0 is the global/default rate.
+    sampling_rates: HashMap<(IpAddr, u32, u64), u64>,
 }
 
 impl V9Parser {
@@ -184,6 +193,8 @@ impl V9Parser {
             }
 
             let mut sampling_loc: Option<FieldLoc> = None;
+            let mut sampler_id_loc: Option<FieldLoc> = None;
+            let mut sampling_space_loc: Option<FieldLoc> = None;
             let mut offset = 0usize;
 
             // Parse all fields (scope + option) as type(2)/length(2) pairs
@@ -193,11 +204,21 @@ impl V9Parser {
                 let field_len = read_u16(data, pos + 2) as usize;
                 pos += 4;
 
-                if field_type == SAMPLING_INTERVAL || field_type == SAMPLING_PACKET_INTERVAL {
-                    sampling_loc = Some(FieldLoc {
-                        offset,
-                        length: field_len,
-                    });
+                let loc = FieldLoc {
+                    offset,
+                    length: field_len,
+                };
+                match field_type {
+                    SAMPLING_INTERVAL | SAMPLING_PACKET_INTERVAL | SAMPLER_RANDOM_INTERVAL => {
+                        sampling_loc = Some(loc);
+                    }
+                    SAMPLER_ID | SELECTOR_ID => {
+                        sampler_id_loc = Some(loc);
+                    }
+                    SAMPLING_PACKET_SPACE => {
+                        sampling_space_loc = Some(loc);
+                    }
+                    _ => {}
                 }
 
                 offset += field_len;
@@ -208,6 +229,8 @@ impl V9Parser {
                 OptionsTemplate {
                     record_len: offset,
                     sampling_interval: sampling_loc,
+                    sampler_id: sampler_id_loc,
+                    sampling_packet_space: sampling_space_loc,
                 },
             );
         }
@@ -233,9 +256,23 @@ impl V9Parser {
             let rec = &data[pos..pos + tmpl.record_len];
 
             if let Some(loc) = &tmpl.sampling_interval {
-                let rate = read_uint(rec, loc.offset, loc.length);
+                let mut rate = read_uint(rec, loc.offset, loc.length);
+
+                if let Some(space_loc) = &tmpl.sampling_packet_space {
+                    let space = read_uint(rec, space_loc.offset, space_loc.length);
+                    if rate > 0 {
+                        rate = (rate + space) / rate;
+                    }
+                }
+
                 if rate > 1 {
-                    self.sampling_rates.insert((exporter, source_id), rate);
+                    let sampler_id = tmpl
+                        .sampler_id
+                        .as_ref()
+                        .map(|loc| read_uint(rec, loc.offset, loc.length))
+                        .unwrap_or(0);
+                    self.sampling_rates
+                        .insert((exporter, source_id, sampler_id), rate);
                 }
             }
 
@@ -274,6 +311,7 @@ impl V9Parser {
                 src_vlan: None,
                 dst_vlan: None,
                 sampling_interval: None,
+                sampler_id: None,
             };
 
             let mut offset = 0usize;
@@ -298,9 +336,10 @@ impl V9Parser {
                     LAST_SWITCHED => tmpl.last_switched = Some(loc),
                     SRC_VLAN => tmpl.src_vlan = Some(loc),
                     DST_VLAN => tmpl.dst_vlan = Some(loc),
-                    SAMPLING_INTERVAL | SAMPLING_PACKET_INTERVAL => {
+                    SAMPLING_INTERVAL | SAMPLING_PACKET_INTERVAL | SAMPLER_RANDOM_INTERVAL => {
                         tmpl.sampling_interval = Some(loc)
                     }
+                    SAMPLER_ID | SELECTOR_ID => tmpl.sampler_id = Some(loc),
                     _ => {}
                 }
 
@@ -331,9 +370,9 @@ impl V9Parser {
             return;
         }
 
-        let options_sampling = self
+        let global_sampling = self
             .sampling_rates
-            .get(&(exporter, source_id))
+            .get(&(exporter, source_id, 0))
             .copied()
             .unwrap_or(1)
             .max(1);
@@ -430,13 +469,20 @@ impl V9Parser {
                 (boot_epoch_ms + first_ms, boot_epoch_ms + last_ms)
             };
 
-            // Use inline sampling field if present, otherwise fall back to options-derived rate.
-            let sampling_rate = tmpl
-                .sampling_interval
-                .as_ref()
-                .map(|loc| read_uint(rec, loc.offset, loc.length))
-                .map(|v| v.max(1))
-                .unwrap_or(options_sampling);
+            // Resolve sampling rate: inline field > per-sampler options rate > global options rate.
+            let sampling_rate = if let Some(loc) = &tmpl.sampling_interval {
+                let v = read_uint(rec, loc.offset, loc.length);
+                if v > 1 { v } else { global_sampling }
+            } else if let Some(loc) = &tmpl.sampler_id {
+                let sid = read_uint(rec, loc.offset, loc.length);
+                self.sampling_rates
+                    .get(&(exporter, source_id, sid))
+                    .copied()
+                    .unwrap_or(global_sampling)
+                    .max(1)
+            } else {
+                global_sampling
+            };
 
             let byte_count = byte_count * sampling_rate;
             let packet_count = packet_count * sampling_rate;
