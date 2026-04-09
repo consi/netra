@@ -1,6 +1,7 @@
 mod asn;
 mod flow;
 mod pipeline;
+mod prometheus;
 mod sse;
 
 use std::path::PathBuf;
@@ -151,6 +152,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/events", get(sse::events_handler))
+        .route("/metrics", get(prometheus::metrics_handler))
         .fallback(static_handler)
         .with_state(state);
 
