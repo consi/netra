@@ -279,8 +279,8 @@ impl V9Parser {
 
                 if let Some(space_loc) = &tmpl.sampling_packet_space {
                     let space = read_uint(rec, space_loc.offset, space_loc.length);
-                    if rate > 0 {
-                        rate = (rate + space) / rate;
+                    if let Some(computed) = (rate + space).checked_div(rate) {
+                        rate = computed;
                     }
                 }
 

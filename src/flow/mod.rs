@@ -1,5 +1,6 @@
 pub mod ipfix;
 pub mod listener;
+pub mod sflow;
 pub mod v5;
 pub mod v9;
 pub mod xdp;
@@ -7,7 +8,7 @@ pub mod xdp;
 use std::fmt;
 use std::net::IpAddr;
 
-/// Minimal extracted data from any NetFlow/IPFIX record.
+/// Minimal extracted data from any NetFlow/IPFIX/sFlow record.
 /// All other fields are discarded at parse time.
 /// Timestamps stored as epoch milliseconds to avoid SystemTime overhead.
 #[derive(Debug)]

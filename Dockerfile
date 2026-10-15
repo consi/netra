@@ -7,7 +7,7 @@ RUN apt-get update && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     corepack enable && \
-    corepack prepare pnpm@latest --activate
+    corepack prepare pnpm@10.34.5 --activate
 
 WORKDIR /app
 COPY . .

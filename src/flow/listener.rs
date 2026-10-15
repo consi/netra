@@ -7,7 +7,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::ipfix::IpfixCache;
 use super::v9::V9Cache;
-use super::{ExtractedFlow, ipfix, v5, v9};
+use super::{ExtractedFlow, ipfix, sflow, v5, v9};
 use crate::asn::AsnDb;
 use crate::pipeline::WindowManager;
 
@@ -109,6 +109,10 @@ pub(crate) fn process_packet(
         5 => v5::parse_into(data, flows),
         9 => v9_parser.parse_into(data, src_ip, flows),
         10 => ipfix_parser.parse_into(data, src_ip, flows),
+        // sFlow versions are 32-bit. v5 is 0x00000005, so the leading u16 is 0.
+        0 if data.len() >= 4 && u32::from_be_bytes([data[0], data[1], data[2], data[3]]) == 5 => {
+            sflow::parse_into(data, flows)
+        }
         _ => return,
     };
 

@@ -4,7 +4,7 @@
 
 See what ASNs your network is talking to by analyzing your flow data.
 
-Single binary that collects NetFlow v5/v9 and IPFIX flows, maps destination and source IPs to ASNs using a BGP-derived database, and serves a live monitoring dashboard.
+Single binary that collects NetFlow v5/v9, IPFIX, and sFlow v5, maps destination and source IPs to ASNs using a BGP-derived database, and serves a live monitoring dashboard.
 
 ## Quick Start
 
@@ -14,7 +14,7 @@ just build    # build frontend + release binary
 ./target/release/netra
 ```
 
-Open `http://localhost:1337` for the dashboard. Point your NetFlow/IPFIX exporter at UDP port `2055`.
+Open `http://localhost:1337` for the dashboard. Point your NetFlow/IPFIX exporter at UDP port `2055`, or sFlow at `6343` (`--flow-port 6343`).
 
 ## Usage
 
@@ -22,9 +22,9 @@ Open `http://localhost:1337` for the dashboard. Point your NetFlow/IPFIX exporte
 netra [OPTIONS]
 
 Options:
-  -f, --flow-port <FLOW_PORT>  UDP port for NetFlow/IPFIX packets [default: 2055]
+  -f, --flow-port <FLOW_PORT>  UDP port for NetFlow/IPFIX/sFlow packets [default: 2055]
   -p, --http-port <HTTP_PORT>  TCP port for the HTTP dashboard and SSE API [default: 1337]
-  -d, --db-path <DB_PATH>      Path to the ASN database file [default: asndb.netra next to binary]
+  -d, --db-path <DB_PATH>      Path to the ASN database file [default: asndb.netra in the project directory, or next to the binary]
       --skip-asns <ASN,ASN,...>  Exclude ASNs from charts and lists (comma-separated)
   -h, --help                   Print help
 ```
@@ -34,12 +34,14 @@ Options:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 1337 | TCP/HTTP | Web dashboard + SSE API |
-| 2055 | UDP | NetFlow v5/v9, IPFIX |
+| 2055 | UDP | NetFlow v5/v9, IPFIX (default) |
+| 6343 | UDP | sFlow v5 (`--flow-port 6343`) |
 
 ## Features
 
 - Multi-core UDP processing with SO_REUSEPORT
 - NetFlow v5, v9, and IPFIX with template caching
+- sFlow v5 sampled headers (Ethernet, VLAN, IPv4/IPv6), scaled by the sample's sampling rate; egress duplicates are ignored when the ingress port is known
 - ASN database from iptoasn.com (auto-downloaded, refreshed daily)
 - 5-second tumbling windows with proportional flow attribution
 - Upload (by destination ASN) and download (by source ASN) tracking

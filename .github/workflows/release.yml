@@ -40,7 +40,7 @@ jobs:
           node-version: "20"
 
       - name: Enable pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+        run: corepack enable && corepack prepare pnpm@10.34.5 --activate
 
       - name: Install musl toolchain
         run: |

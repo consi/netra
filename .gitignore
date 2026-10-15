@@ -19,6 +19,9 @@
 .env
 .env.local
 
+# ASN database downloaded at runtime
+/asndb.netra
+
 # Build artifacts
 /dist/pkg/
 /rpmbuild/

@@ -69,7 +69,7 @@ pub async fn download_and_build() -> Result<AsnDb, Box<dyn std::error::Error + S
             let country = if country_str.len() >= 2 {
                 [country_str[0], country_str[1]]
             } else {
-                [b'?', b'?']
+                *b"??"
             };
             AsnMeta {
                 country,

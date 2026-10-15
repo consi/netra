@@ -124,7 +124,7 @@ fn aggregate_for_prometheus(
                     entries.push((asn, bytes, packets, flows));
                 }
 
-                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.sort_by_key(|a| std::cmp::Reverse(a.1));
                 entries.truncate(top_n);
 
                 let asns = entries

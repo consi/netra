@@ -32,7 +32,7 @@ pub struct AppState {
     about = "Network flow analyzer with ASN mapping and live dashboard"
 )]
 struct Args {
-    /// UDP port to listen for NetFlow/IPFIX packets
+    /// UDP port to listen for NetFlow/IPFIX/sFlow packets
     #[arg(short = 'f', long, default_value_t = 2055)]
     flow_port: u16,
 
@@ -40,13 +40,43 @@ struct Args {
     #[arg(short = 'p', long, default_value_t = 1337)]
     http_port: u16,
 
-    /// Path to the ASN database file
+    /// Path to the ASN database file.
+    /// Default: asndb.netra in the project directory, or next to the binary.
     #[arg(short = 'd', long, default_value = None)]
     db_path: Option<PathBuf>,
 
     /// Comma-separated list of ASNs to exclude from charts and lists
     #[arg(long, value_delimiter = ',')]
     skip_asns: Vec<u32>,
+}
+
+/// Directory for `asndb.netra` when `--db-path` is not set.
+///
+/// A checkout stores it at the project root (the directory that contains
+/// `Cargo.toml`), so a process started with cwd `/` does not write the
+/// database there. An installed binary with no project tree nearby keeps
+/// the file next to the executable.
+fn default_db_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(db_dir_from_exe)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn db_dir_from_exe(exe: &std::path::Path) -> Option<PathBuf> {
+    let start = exe.parent()?;
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Some(start.to_path_buf())
 }
 
 #[tokio::main]
@@ -60,17 +90,9 @@ async fn main() {
     tracing::info!("netra starting up");
 
     // --- ASN database ---
-    let db_path = args.db_path.unwrap_or_else(|| {
-        let dir = std::env::current_dir()
-            .ok()
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            })
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        dir.join("asndb.netra")
-    });
+    let db_path = args
+        .db_path
+        .unwrap_or_else(|| default_db_dir().join("asndb.netra"));
 
     let asn_db_arc = match asn::init(&db_path).await {
         Ok(db) => db,
@@ -197,5 +219,39 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
             .status(StatusCode::NOT_FOUND)
             .body(axum::body::Body::from("Not Found"))
             .unwrap(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::db_dir_from_exe;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("netra-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn db_dir_is_cargo_project_root() {
+        let root = scratch("proj");
+        let bin_dir = root.join("target/release");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(root.join("Cargo.toml"), b"[package]\nname = \"netra\"\n").unwrap();
+
+        let got = db_dir_from_exe(&bin_dir.join("netra")).unwrap();
+        assert_eq!(got, root);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn db_dir_falls_back_to_exe_directory() {
+        let root = scratch("installed");
+        let got = db_dir_from_exe(&root.join("netra")).unwrap();
+        assert_eq!(got, root);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
